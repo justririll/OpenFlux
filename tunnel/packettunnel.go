@@ -47,7 +47,7 @@ type PacketTunnel struct {
 func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocolCUBIC, udp.NewProtocol},
 	})
 
 	SetTCPBuffers(s)

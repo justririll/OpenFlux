@@ -34,10 +34,17 @@ type TCPTunnel struct {
 // TCP buffer size range for gvisor stacks. Big by default (exit node on a VPS);
 // the memory-constrained iOS Network Extension shrinks these before building
 // its stacks (see the packet-tunnel bridge).
+//
+// These bound the window, and the window over a round trip bounds throughput.
+// Relaying through a document service costs roughly 190ms per round trip
+// against 45ms direct, so the old 256KB default capped a connection at about
+// 1.3MB/s no matter how much bandwidth was available, and the 1MB ceiling
+// capped it at 5MB/s. Buffers are limits rather than reservations, so raising
+// them costs nothing on idle connections.
 var (
 	TCPBufMin     = 65536
-	TCPBufDefault = 262144
-	TCPBufMax     = 1048576
+	TCPBufDefault = 1048576
+	TCPBufMax     = 8388608
 )
 
 // SetTCPBuffers applies the configured TCP send/receive buffer ranges to s.
@@ -62,7 +69,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 	utils.Debugf("[TUNNEL] Net stack init...")
 	t.gvisorStack = stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocolCUBIC},
 	})
 
         SetTCPBuffers(t.gvisorStack)

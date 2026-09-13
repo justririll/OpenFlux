@@ -280,6 +280,55 @@ Override it if your box wants something else:
 OPENFLUX_RELAY_WORKERS=256
 ```
 
+## Throughput
+
+Relaying through a document service is a high-latency path: about 190ms per
+round trip on a test VPS, against 45ms direct. Latency that high is what
+decides throughput, because a TCP connection can only have one window of data
+in flight per round trip.
+
+Two settings followed from that, both in `tunnel/tunnel.go`:
+
+- **CUBIC instead of Reno.** gvisor's `tcp.NewProtocol` still defaults to Reno,
+  which grows its window linearly and gives up half of it on every loss. Over
+  a 190ms path that recovers far too slowly. `tcp.NewProtocolCUBIC` is the
+  same stack with a congestion control designed for exactly this.
+- **Windows sized for the round trip.** The receive and send buffers cap the
+  window, and the window over the round trip caps the rate. The old 256KB
+  default limited a single connection to roughly 1.3MB/s however much
+  bandwidth was actually available. They are limits, not reservations, so
+  idle connections cost nothing.
+
+Measured on the test VPS, downloading through one exit node:
+
+| | before | after |
+|---|---|---|
+| single 8MB stream | 66.4s (120 KB/s) | **6.6s (1.22 MB/s)** |
+| 16MB across 4 streams | did not finish in 150s | **12s** |
+
+A third setting is the exit node's garbage collector. It used to be pinned at
+`GOGC=20`, which on a single core spends real forwarding time collecting after
+every batch's JSON, base64 and TLS allocations. Measured over the same 8MB
+download:
+
+| GOGC | throughput | resident |
+|---|---|---|
+| 20 (old) | 1.10 / 0.98 MB/s | 46MB |
+| 100 (now the default) | **1.23 / 1.11 MB/s** | 72MB |
+| 400 | 1.09 / 1.08 MB/s | 211MB |
+
+More is not better - a bigger heap costs more than it saves. `GOGC` and
+`GOMEMLIMIT` from the environment take precedence, and `GOMEMLIMIT` is the
+better lever on a genuinely memory-starved box because it caps the heap
+without paying for a collection on every small increment.
+
+Round-trip time is unchanged at ~0.76s for a small request. That is the relay
+itself and no local setting will move it, so the tunnel will always feel
+slower than the link it runs over even when bulk transfers are fast.
+
+The iOS Network Extension deliberately does not get these buffers: it runs
+under a ~50MB memory cap and forwards raw L3 packets with no stack of its own.
+
 ## Flags
 
 | Flag          | Default             | Description                |

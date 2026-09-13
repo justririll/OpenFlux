@@ -46,10 +46,15 @@ func main() {
 		tunnel.SetLocalIP(localIP)
 	}
 
-	// The exit node often runs on a tiny VPS; keep the heap tight under load
-	// (GC aggressively). Set GOMEMLIMIT in the environment for a hard soft-cap.
-	if *exitNode {
-		godebug.SetGCPercent(20)
+	// The exit node often runs on a tiny VPS, so the heap is kept modest -
+	// but collecting at 20% costs real throughput once the relay is busy.
+	// Every batch allocates for JSON, base64 and TLS, and on a single core
+	// that GC time comes straight out of forwarding. GOGC and GOMEMLIMIT in
+	// the environment take precedence; GOMEMLIMIT is the better lever when
+	// the box really is memory starved, since it caps the heap without
+	// paying for a collection on every small increment.
+	if *exitNode && os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" {
+		godebug.SetGCPercent(100)
 	}
 
 	if !*exitNode && !*client {
