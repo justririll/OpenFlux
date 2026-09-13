@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"runtime"
 	"regexp"
 	"strconv"
 	"strings"
@@ -49,15 +51,47 @@ type VolgaConfig struct {
 	KeepAliveInterval  time.Duration
 }
 
+// relayWorkers sizes the relay pool.
+//
+// This was a flat 2000, which is far more than a tunnel can use: batches
+// carry up to 20 packets, so even a busy link keeps only tens of requests in
+// flight. The cost showed up when several exit nodes shared one small VPS -
+// 2000 goroutines and up to 2000 idle TLS connections per instance, all
+// contending for the same core, which is enough to starve every link but one.
+//
+// Set OPENFLUX_RELAY_WORKERS to override.
+func relayWorkers() int {
+	if env := os.Getenv("OPENFLUX_RELAY_WORKERS"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			return n
+		}
+		utils.Debugf("[VOLGA] ignoring invalid OPENFLUX_RELAY_WORKERS=%q", env)
+	}
+	n := 128 * runtime.NumCPU()
+	if n < 128 {
+		n = 128
+	}
+	if n > 1024 {
+		n = 1024
+	}
+	return n
+}
+
 func DefaultVolgaConfig() VolgaConfig {
+	workers := relayWorkers()
 	return VolgaConfig{
-		MaxIdleConnsPerHost: 2000,
-		MaxIdleConns:        4000,
+		// One idle connection per worker is the most that can ever be
+		// needed, and nothing is gained by keeping more than that alive.
+		MaxIdleConnsPerHost: workers,
+		MaxIdleConns:        workers * 2,
 		IdleConnTimeout:     90 * time.Second,
 		RelayTimeout:        30 * time.Second,
 
-		WorkerCount: 2000,
-		QueueSize:   1000000,
+		WorkerCount: workers,
+		// The queue only has to absorb a burst while the workers drain it.
+		// A million entries reserved tens of megabytes per instance up front
+		// for a backlog that would mean the link was already dead.
+		QueueSize: 65536,
 
 		BatchSize:     20,
 		BatchTimeout:  2 * time.Millisecond,

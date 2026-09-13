@@ -264,6 +264,22 @@ If drops still climb, the box is simply out of headroom: run fewer instances
 per host, or give each one a dedicated egress IP with `--local-ip` so the
 kernel hands it less to sift through.
 
+### Sizing the relay pool
+
+The `vyandex` relay pool is sized from the CPU count (128 workers per core,
+capped at 1024). It used to be a flat 2000 workers with room for 2000 idle
+TLS connections per instance, which a tunnel cannot use - batches carry up to
+20 packets, so even a busy link keeps only tens of requests in flight - and on
+a one-core VPS running three exit nodes it was thousands of goroutines
+competing for a single core.
+
+Override it if your box wants something else:
+
+```sh
+# /etc/openflux/instances/phone.env
+OPENFLUX_RELAY_WORKERS=256
+```
+
 ## Flags
 
 | Flag          | Default             | Description                |
