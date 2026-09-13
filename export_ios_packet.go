@@ -72,16 +72,36 @@ func OpenFluxStartPacketTunnel(transportType, url, maxToken, maxUid *C.char) (rc
 	debug.SetMemoryLimit(40 << 20)
 	debug.SetGCPercent(20)
 
+	// Same link handling as the SOCKS5 bridge: ydocs://DOC_URL#SECRET
+	// switches the tunnel to AES-256-GCM, a plain URL leaves it unencrypted.
+	link, err := transport.ParseLink(docURL)
+	if err != nil {
+		utils.Debugf("[PKT] Bad link: %v", err)
+		return C.int(startBadLink)
+	}
+	docURL = link.URL
+
 	config := transport.DefaultConfig()
-	var t transport.Transport
+	var inner transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		inner = yandex.NewYandexDocsTransport(docURL, config)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		inner = oneme.NewOneMeTransport(false, mToken, uidint, config)
 	default:
 		return C.int(startBadTransport)
+	}
+
+	t, err := link.Wrap(inner, config, tt, false)
+	if err != nil {
+		utils.Debugf("[PKT] Encryption setup failed: %v", err)
+		return C.int(startBadLink)
+	}
+	if link.Encrypted() {
+		utils.Debugf("[PKT] Transport encryption: AES-256-GCM enabled")
+	} else {
+		utils.Debugf("[PKT] Transport encryption: DISABLED (plaintext to the document provider)")
 	}
 
 	outQ := make(chan []byte, 1024)

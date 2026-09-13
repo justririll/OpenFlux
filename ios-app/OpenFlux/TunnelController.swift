@@ -62,6 +62,8 @@ final class TunnelController: ObservableObject {
             appendLog("[app] transport failed to start")
         case 4:
             appendLog("[app] port \(port) is busy — pick another port")
+        case 6:
+            appendLog("[app] bad ydocs:// link — check the URL and that the secret is 16+ characters")
         default:
             appendLog("[app] start failed (code \(rc))")
         }

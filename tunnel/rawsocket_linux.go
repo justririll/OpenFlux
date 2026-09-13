@@ -16,6 +16,34 @@ import (
 	"universal-bypass-tool/utils"
 )
 
+const (
+	// synTTL is how long an unanswered outgoing SYN is remembered. A SYN-ACK
+	// arriving later than this is beyond any realistic retry window, so the
+	// entry can never be matched again - it would only sit in the map for the
+	// life of the process.
+	synTTL = 2 * time.Minute
+
+	// portTTL bounds how long a port stays active with no traffic at all. A
+	// connection torn down without a FIN or RST (the peer vanished, the
+	// tunnel dropped) used to hold its entry forever. Matched to the Linux
+	// default TCP keep-alive time so a legitimately idle connection is
+	// refreshed long before it expires.
+	portTTL = 2 * time.Hour
+
+	// portTouchInterval is the minimum gap between refreshes of one port's
+	// last-seen time. sync.Map writes are far costlier than reads and this
+	// sits on the per-packet path, so refresh at most once per interval.
+	portTouchInterval = time.Minute
+
+	// sweepInterval is how often expired tracking entries are reaped.
+	sweepInterval = time.Minute
+
+	// maxConsecutiveReadErrors bounds how long the reader keeps retrying a
+	// raw socket that only ever returns errors, so a genuinely dead fd does
+	// not become a hot spin loop.
+	maxConsecutiveReadErrors = 100
+)
+
 type RawSocketEndpoint struct {
 	dispatcher      stack.NetworkDispatcher
 	sendFd          int
@@ -62,6 +90,7 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 	}
 
 	go ep.readLoop()
+	go ep.sweepLoop()
 	return ep, nil
 }
 
@@ -71,6 +100,7 @@ func (e *RawSocketEndpoint) SetTransportSender(sendFunc func([]byte)) {
 
 func (e *RawSocketEndpoint) readLoop() {
 	buf := make([]byte, 65535)
+	consecutiveErrors := 0
 
 	for {
 		n, _, err := syscall.Recvfrom(e.recvFd, buf, 0)
@@ -79,9 +109,29 @@ func (e *RawSocketEndpoint) readLoop() {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			utils.Debugf("[RAW-NIC%d] Read error: %v", e.nicID, err)
-			return
+			// EINTR just means a signal arrived mid-syscall. Returning on it
+			// killed the exit node's entire inbound path for the life of the
+			// process: replies stopped being decapsulated, every tunnelled
+			// connection hung, and only a restart brought it back.
+			if err == syscall.EINTR {
+				continue
+			}
+			if err == syscall.EBADF {
+				utils.Debugf("[RAW-NIC%d] Receive socket closed, stopping reader", e.nicID)
+				return
+			}
+			consecutiveErrors++
+			if consecutiveErrors > maxConsecutiveReadErrors {
+				utils.Debugf("[RAW-NIC%d] Giving up after %d consecutive read errors: %v",
+					e.nicID, consecutiveErrors, err)
+				return
+			}
+			utils.Debugf("[RAW-NIC%d] Read error (%d in a row): %v", e.nicID, consecutiveErrors, err)
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
+		consecutiveErrors = 0
+
 		if n < 40 {
 			continue
 		}
@@ -97,6 +147,7 @@ func (e *RawSocketEndpoint) readLoop() {
 			if _, active := e.activePorts.Load(dstPort); !active {
 				continue
 			}
+			e.touchPort(dstPort)
 
 			if flags == 0x12 {
 				ackNum := uint32(buf[28])<<24 | uint32(buf[29])<<16 | uint32(buf[30])<<8 | uint32(buf[31])
@@ -172,8 +223,10 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 
 		if tcpHeader[13]&0x02 != 0 {
 			seqNum := uint32(tcpHeader[4])<<24 | uint32(tcpHeader[5])<<16 | uint32(tcpHeader[6])<<8 | uint32(tcpHeader[7])
-			e.outgoingSYNs.Store(seqNum, true)
-			e.activePorts.Store(srcPort, true)
+			e.outgoingSYNs.Store(seqNum, time.Now())
+			e.activePorts.Store(srcPort, time.Now())
+		} else {
+			e.touchPort(srcPort)
 		}
 
 		if tcpHeader[13]&0x01 != 0 || tcpHeader[13]&0x04 != 0 {
@@ -198,6 +251,51 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 		n++
 	}
 	return n, nil
+}
+
+// touchPort refreshes a live port's last-seen time. It never creates an
+// entry: only an outgoing SYN opens a port, so a stray packet cannot resurrect
+// one that was closed by a FIN or RST.
+func (e *RawSocketEndpoint) touchPort(port uint16) {
+	seen, ok := e.activePorts.Load(port)
+	if !ok {
+		return
+	}
+	if at, ok := seen.(time.Time); ok && time.Since(at) < portTouchInterval {
+		return
+	}
+	e.activePorts.Store(port, time.Now())
+}
+
+// sweepLoop reaps tracking entries that can no longer be matched. Both maps
+// used to grow for the life of the process: an outgoing SYN that never drew a
+// SYN-ACK was never removed, and a port whose connection died without a FIN or
+// RST kept its entry forever. On a long-running exit node that is an unbounded
+// leak.
+func (e *RawSocketEndpoint) sweepLoop() {
+	ticker := time.NewTicker(sweepInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		expire := func(m *sync.Map, ttl time.Duration) int {
+			dropped := 0
+			m.Range(func(key, value any) bool {
+				at, ok := value.(time.Time)
+				if !ok || time.Since(at) > ttl {
+					m.Delete(key)
+					dropped++
+				}
+				return true
+			})
+			return dropped
+		}
+
+		syns := expire(&e.outgoingSYNs, synTTL)
+		ports := expire(&e.activePorts, portTTL)
+		if syns > 0 || ports > 0 {
+			utils.Debugf("[RAW-NIC%d] swept %d stale SYNs, %d stale ports", e.nicID, syns, ports)
+		}
+	}
 }
 
 func (e *RawSocketEndpoint) MTU() uint32                                 { return 1500 }

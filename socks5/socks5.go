@@ -5,9 +5,16 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"universal-bypass-tool/utils"
 )
+
+// handshakeTimeout bounds the SOCKS5 greeting and CONNECT request. Without it
+// a client that opens a connection and then says nothing holds a goroutine and
+// an fd for the life of the process - a slow but unbounded leak on any client
+// left running for days.
+const handshakeTimeout = 30 * time.Second
 
 type Dialer interface {
 	DialTCP(address string) (net.Conn, error)
@@ -96,6 +103,11 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	}()
 	defer clientConn.Close()
 
+	if err := clientConn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		utils.Debugf("[SOCKS5] Cannot set handshake deadline: %v", err)
+		return
+	}
+
 	buf := make([]byte, 256)
 	n, err := clientConn.Read(buf)
 	if err != nil || n < 2 || buf[0] != 0x05 {
@@ -141,6 +153,13 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	defer targetConn.Close()
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+
+	// The handshake is done; a tunnelled connection may legitimately idle for
+	// hours, so it must not inherit the handshake deadline.
+	if err := clientConn.SetDeadline(time.Time{}); err != nil {
+		utils.Debugf("[SOCKS5] Cannot clear handshake deadline: %v", err)
+		return
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)

@@ -141,6 +141,57 @@ Setup commands for desktop client:
 
 Then set up SOCKS5 proxy in your browser at localhost:1080.
 
+## Encryption
+
+> **Upgrade both peers together.** This build tags every packet with a one-byte
+> frame so the keep-alive travels through the same compression and encryption
+> as real traffic instead of being a constant plaintext marker. A peer on an
+> older build does not understand that tag, so the client and the exit node
+> must be updated at the same time.
+
+The transport itself carries your packets as base64 inside document messages.
+The hops to the provider are TLS, so your ISP and the local network see
+nothing - but TLS terminates at the provider, and the document is the
+rendezvous point. Without the layer below, **the document provider sees every
+tunnelled packet in plaintext**, and anyone holding the document URL can both
+read the tunnel and inject packets into it.
+
+Turn on end-to-end AES-256-GCM by putting a shared secret in the URL:
+
+```
+ydocs://DOC_URL#SHARED_SECRET
+```
+
+Give **both peers the same link**. Everything up to the final `#` is the
+document URL (`https://` is implied); everything after it is the secret, which
+never leaves the machine - it is only an input to the key derivation.
+
+```bash
+# exit node
+sudo ./universal-bypass-tool --exit-node \
+    --url "ydocs://docs.yandex.ru/docs/view?id=YOUR_DOC#a-long-shared-secret" --debug
+
+# client
+./universal-bypass-tool --client \
+    --url "ydocs://docs.yandex.ru/docs/view?id=YOUR_DOC#a-long-shared-secret" \
+    --socks5 :1080 --debug
+```
+
+Both sides log `Transport encryption: AES-256-GCM enabled` on startup. The
+iOS and Android clients accept the same link in their URL field.
+
+Details:
+
+- The secret must be at least 16 characters. Generate one with
+  `openssl rand -base64 32`.
+- Each direction gets its own derived key, every packet carries a random
+  nonce, and replays are rejected within a bounded window.
+- A plain `https://` URL keeps the old, unencrypted behaviour unchanged.
+- To keep the secret out of shell history and `ps` output, pass a plain URL
+  plus `--encryption-key-file /path/to/secret`. The two forms interoperate:
+  a peer using the key file and a peer using a `ydocs://` link derive the same
+  keys as long as the document URL and the secret match.
+
 ## Flags
 
 | Flag          | Default             | Description                |
@@ -148,11 +199,12 @@ Then set up SOCKS5 proxy in your browser at localhost:1080.
 | `--client`    |                     | Run as client              |
 | `--exit-node` |                     | Run as exit node           |
 | `--socks5`    | `:1080`             | SOCKS5 listen address      |
-| `--url`       | `https://localhost` | Document URL (Yandex Docs) |
+| `--url`       | `https://localhost` | Document URL, or a `ydocs://DOC_URL#SECRET` link |
 | `--maxToken`  | ``                  | Auth token (Max)           |
 | `--maxUid`    | ``                  | User ID (Max)              |
 | `--debug`     | `false`             | Enable verbose logging     |
 | `--transport` | `yandex`            | Select transport backend   |
+| `--encryption-key-file` | ``        | Read the shared secret from a file instead of the link |
 
 ## Implementing custom transports
 

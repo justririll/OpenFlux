@@ -33,34 +33,91 @@ type YandexDocsInfo struct {
 	OpenCmd     map[string]interface{}
 }
 
+// keepAliveMarker was this transport's own keep-alive payload before the
+// keep-alive moved to the outermost layer, where it is encrypted along with
+// everything else. It is still recognised on receipt so a peer running an
+// older build does not inject its keep-alives into the network stack.
+const keepAliveMarker = "---KA---"
+
+// cursorFrame wraps an already-encoded payload in the socket.io cursor
+// message the document editor relays to the other collaborator.
+func cursorFrame(payload string) string {
+	return `42["message",{"type":"cursor","cursor":"18;` + payload + `"}]`
+}
+
+func authTokenFrame(token string) string {
+	return `40{"token":"` + token + `"}`
+}
+
+const (
+	// wsReadTimeout bounds a single blocking read. A silent peer - NAT
+	// timeout, half-open TCP, the phone changing networks - used to park
+	// ReadMessage forever: no error, so no reconnect, so the tunnel stayed
+	// dead until the process was restarted. The deadline turns that silence
+	// into an ordinary read error. 60s comfortably covers both the socket.io
+	// server ping and our own 10s keep-alive.
+	wsReadTimeout = 60 * time.Second
+
+	// wsWriteTimeout caps a single write so a stalled send buffer cannot
+	// wedge the writer goroutine.
+	wsWriteTimeout = 15 * time.Second
+
+	// sessionHealthyAfter is how long a session must live to count as
+	// healthy, resetting the reconnect backoff so routine long-lived
+	// reconnects do not inherit a grown delay.
+	sessionHealthyAfter = 15 * time.Second
+
+	// writerIdleWake bounds how long the writer parks on an empty queue, so
+	// it notices Stop promptly.
+	writerIdleWake = 500 * time.Millisecond
+)
+
 type DocSession struct {
-	Info       YandexDocsInfo
-	Conn       *websocket.Conn
-	WriteQueue chan []byte
-	UserID     string
-	writeMu    sync.Mutex
+	Info    YandexDocsInfo
+	Conn    *websocket.Conn
+	UserID  string
+	writeMu sync.Mutex
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// Without a deadline a stalled socket blocks the writer indefinitely,
+	// which is one of the ways the tunnel used to wedge until a restart.
+	if err := s.Conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+		return err
+	}
 	return s.Conn.WriteMessage(messageType, data)
 }
 
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
+
+	// writeQueue outlives any single session, so a reconnect does not lose
+	// the packets already queued for it.
+	writeQueue chan []byte
+
+	stopped  chan struct{}
+	stopOnce sync.Once
 
 	userCounter atomic.Int32
 	baseUserID  string
+	userID      string // stable across reconnects; guarded by Mu
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
+	queueSize := config.MaxQueueSize
+	if queueSize <= 0 {
+		queueSize = 1024
+	}
 	t := &YandexDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		url:           url,
+		writeQueue:    make(chan []byte, queueSize),
+		stopped:       make(chan struct{}),
 	}
 	t.baseUserID = randUserID()
 	return t
@@ -72,10 +129,23 @@ func (t *YandexDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
-	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
-	t.connectToDoc(0)
+	utils.SafeGo("yandex.writer", t.writerLoop)
+	utils.SafeGo("yandex.connect", t.connectLoop)
 
 	return nil
+}
+
+// Stop tears the live socket down as well as clearing the running flag.
+// Without closing the connection the reader would sit in ReadMessage until
+// its deadline expired, keeping a goroutine and an fd alive across a
+// stop/start cycle - which is exactly what the mobile bridges do.
+func (t *YandexDocsTransport) Stop() error {
+	err := t.BaseTransport.Stop()
+	t.stopOnce.Do(func() { close(t.stopped) })
+	if session := t.currentSession(); session != nil {
+		_ = session.Conn.Close()
+	}
+	return err
 }
 
 func (t *YandexDocsTransport) Send(data []byte) error {
@@ -83,16 +153,8 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 		return fmt.Errorf("transport not connected")
 	}
 
-	t.Mu.RLock()
-	session := t.session
-	t.Mu.RUnlock()
-
-	if session == nil {
-		return fmt.Errorf("no active session")
-	}
-
 	select {
-	case session.WriteQueue <- data:
+	case t.writeQueue <- data:
 		t.RecordSend(len(data))
 		return nil
 	default:
@@ -100,163 +162,184 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 	}
 }
 
-func (t *YandexDocsTransport) connectToDoc(attempt int) {
-	if !t.IsRunning() {
+func (t *YandexDocsTransport) currentSession() *DocSession {
+	t.Mu.RLock()
+	defer t.Mu.RUnlock()
+	return t.session
+}
+
+func (t *YandexDocsTransport) setSession(session *DocSession) {
+	t.Mu.Lock()
+	t.session = session
+	t.Mu.Unlock()
+	t.SetConnected(true)
+}
+
+func (t *YandexDocsTransport) clearSession(session *DocSession) {
+	t.Mu.Lock()
+	if t.session == session {
+		t.session = nil
+	}
+	t.Mu.Unlock()
+	t.SetConnected(false)
+}
+
+// dropSession closes session if it is still the live one, unblocking the
+// reader so connectLoop can replace it. Safe from any goroutine, and safe to
+// call more than once.
+func (t *YandexDocsTransport) dropSession(session *DocSession, reason string) {
+	if session == nil || t.currentSession() != session {
 		return
 	}
+	utils.Debugf("[YDOCS] dropping session: %s", reason)
+	t.SetConnected(false)
+	_ = session.Conn.Close()
+}
 
-	utils.Debugf("[YDOCS] connectToDoc attempt ...")
+// sessionUserID returns the document user id, allocated once and then reused
+// for every reconnect so the document keeps seeing a single collaborator.
+func (t *YandexDocsTransport) sessionUserID() string {
+	t.Mu.Lock()
+	defer t.Mu.Unlock()
+	if t.userID == "" {
+		t.userID = t.baseUserID + fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
+	}
+	return t.userID
+}
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				utils.Debugf("[PANIC] recovered in yandex.connect: %v", r)
-			}
-		}()
-		t.Mu.Lock()
-		existingSession := t.session
-		t.Mu.Unlock()
+// connectLoop owns the entire connection lifecycle in a single goroutine.
+// Reconnects used to be scheduled by whichever goroutine noticed the failure,
+// so a read error and a failed keep-alive could each start one and the
+// loser's socket was orphaned - leaking an fd, a goroutine and a second live
+// reader per reconnect. A single owner makes that overlap impossible.
+func (t *YandexDocsTransport) connectLoop() {
+	attempt := 0
 
-		var userID string
-		if existingSession != nil {
-			userID = existingSession.UserID
-		} else {
-			suffix := fmt.Sprintf("%03d", t.userCounter.Add(1)%1000)
-			userID = t.baseUserID + suffix
+	for t.IsRunning() {
+		startedAt := time.Now()
+		if err := t.runSession(); err != nil {
+			utils.Debugf("[YDOCS] session ended: %v", err)
 		}
-
-		info, err := t.fetchDocInfo(t.url, userID)
-		if err != nil {
-			utils.Debugf("[YDOCS] fetchDocInfo failed: %v", err)
-			t.scheduleReconnect(attempt)
+		if !t.IsRunning() {
 			return
 		}
 
-		// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
-		// can't hang the whole transport (HandshakeTimeout alone proved
-		// insufficient on iOS).
-		dialer := websocket.Dialer{
-			HandshakeTimeout: 15 * time.Second,
-			NetDialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+		// A session that stayed up counts as healthy: restart the backoff so
+		// routine long-lived reconnects do not inherit a grown delay.
+		if time.Since(startedAt) > sessionHealthyAfter {
+			attempt = 0
 		}
-		headers := http.Header{}
-		headers.Set("User-Agent", "Mozilla/5.0")
-		headers.Set("Origin", info.Origin)
-		headers.Set("Cookie", info.CookieStr)
-		headers.Set("Host", info.Host)
-
-		utils.Debugf("[YDOCS] WebSocket dial %s", info.WsURL)
-		conn, resp, err := dialer.Dial(info.WsURL, headers)
-		if err != nil {
-			status := 0
-			if resp != nil {
-				status = resp.StatusCode
-			}
-			utils.Debugf("[YDOCS] WebSocket dial failed (http %d): %v", status, err)
-			t.scheduleReconnect(attempt)
+		attempt++
+		if attempt >= t.GetConfig().MaxReconnectAttempts {
+			utils.Debugf("[YDOCS] giving up after %d attempts", attempt)
 			return
 		}
-		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
+		t.RecordReconnect()
 
-		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
-		if existingSession != nil {
-			writeQueue = existingSession.WriteQueue
+		d := reconnectBackoff(attempt)
+		utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, attempt)
+		select {
+		case <-time.After(d):
+		case <-t.stopped:
+			return
 		}
+	}
+}
 
-		session := &DocSession{
-			Info:       info,
-			Conn:       conn,
-			WriteQueue: writeQueue,
-			UserID:     userID,
+// runSession builds one WebSocket session and reads it until it fails. It
+// always releases the socket before returning.
+func (t *YandexDocsTransport) runSession() error {
+	userID := t.sessionUserID()
+
+	info, err := t.fetchDocInfo(t.url, userID)
+	if err != nil {
+		return fmt.Errorf("fetchDocInfo: %w", err)
+	}
+
+	// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
+	// can't hang the whole transport (HandshakeTimeout alone proved
+	// insufficient on iOS).
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		NetDialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	headers := http.Header{}
+	headers.Set("User-Agent", "Mozilla/5.0")
+	headers.Set("Origin", info.Origin)
+	headers.Set("Cookie", info.CookieStr)
+	headers.Set("Host", info.Host)
+
+	utils.Debugf("[YDOCS] WebSocket dial %s", info.WsURL)
+	conn, resp, err := dialer.Dial(info.WsURL, headers)
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
 		}
+		return fmt.Errorf("websocket dial (http %d): %w", status, err)
+	}
+	// The old code never closed the socket, leaking one fd and one blocked
+	// goroutine on every single reconnect.
+	defer conn.Close()
+	utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
 
-		t.Mu.Lock()
-		t.session = session
-		t.SetConnected(true)
-		t.Mu.Unlock()
+	session := &DocSession{Info: info, Conn: conn, UserID: userID}
+	t.setSession(session)
+	defer t.clearSession(session)
 
-		if existingSession == nil {
-			utils.SafeGo("yandex.writer", t.writerLoop)
+	if err := session.safeWrite(websocket.TextMessage, []byte(authTokenFrame(info.Token))); err != nil {
+		return fmt.Errorf("auth handshake: %w", err)
+	}
+
+	authData := map[string]interface{}{
+		"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
+		"user": map[string]interface{}{"id": userID}, "editorType": 0,
+		"lastOtherSaveTime": -1, "permissions": info.Permissions,
+		"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
+	}
+	messagePart, _ := json.Marshal([]interface{}{"message", authData})
+	if err := session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart)))); err != nil {
+		return fmt.Errorf("auth message: %w", err)
+	}
+
+	for t.IsRunning() {
+		if err := conn.SetReadDeadline(time.Now().Add(wsReadTimeout)); err != nil {
+			return fmt.Errorf("set read deadline: %w", err)
 		}
-
-		// Auth - use safeWrite
-		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
-
-		authData := map[string]interface{}{
-			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
-			"user": map[string]interface{}{"id": userID}, "editorType": 0,
-			"lastOtherSaveTime": -1, "permissions": info.Permissions,
-			"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
 		}
-		messagePart, _ := json.Marshal([]interface{}{"message", authData})
-		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
-
-		connectedAt := time.Now()
-		for t.IsRunning() {
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				utils.Debugf("[YDOCS] Read error: %v", err)
-				t.SetConnected(false)
-				// If the session was healthy for a while, treat the next
-				// connect as fresh (attempt -1 -> next attempt 0) so backoff
-				// doesn't keep growing across normal long-lived reconnects.
-				next := attempt
-				if time.Since(connectedAt) > 15*time.Second {
-					next = -1
-				}
-				t.scheduleReconnect(next)
-				return
-			}
-			t.handleMessage(session, message)
-		}
-	}()
+		t.handleMessage(session, message)
+	}
+	return nil
 }
 
 func (t *YandexDocsTransport) writerLoop() {
 	for t.IsRunning() {
-		t.Mu.Lock()
-		session := t.session
-		t.Mu.Unlock()
-
-		if session == nil || session.Conn == nil {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
+		// Block on the queue rather than polling it every 10ms: the old poll
+		// burned a core and added up to 10ms of latency to every packet.
 		select {
-		case packet := <-session.WriteQueue:
+		case packet := <-t.writeQueue:
+			session := t.currentSession()
+			if session == nil {
+				continue // no live socket; the tunnel's TCP layer retransmits
+			}
 			payload := base64.StdEncoding.EncodeToString(packet)
-			msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+			msg := cursorFrame(payload)
 
 			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 				utils.Debugf("[YDOCS] Write error: %v", err)
+				// This socket is gone. Tear it down now instead of leaving
+				// the reader parked until its deadline expires.
+				t.dropSession(session, "write error")
 			}
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-}
-
-func (t *YandexDocsTransport) keepAliveLoop() {
-	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
-	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
-
-	for t.IsRunning() {
-		<-ticker.C
-		t.Mu.Lock()
-		session := t.session
-		t.Mu.Unlock()
-
-		if session != nil && session.Conn != nil {
-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
-				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
-				t.SetConnected(false)
-			}
+		case <-time.After(writerIdleWake):
+		case <-t.stopped:
+			return
 		}
 	}
 }
@@ -264,7 +347,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
-	if strings.Contains(text, "---KA---") {
+	if strings.Contains(text, keepAliveMarker) {
 		return
 	}
 
@@ -316,25 +399,6 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 		return matches[1]
 	}
 	return ""
-}
-
-func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
-	next := attempt + 1
-	if !t.IsRunning() || next >= t.GetConfig().MaxReconnectAttempts {
-		return
-	}
-
-	// Back off before retrying so a server that closes us immediately doesn't
-	// turn into a tight connect/close loop (previously reconnect was instant).
-	d := reconnectBackoff(next)
-	utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, next)
-	time.Sleep(d)
-	if !t.IsRunning() {
-		return
-	}
-
-	t.RecordReconnect()
-	t.connectToDoc(next)
 }
 
 // reconnectBackoff returns an exponential backoff with jitter, capped at 15s.

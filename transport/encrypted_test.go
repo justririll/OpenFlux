@@ -2,23 +2,61 @@ package transport
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
+// testTransport is the fake wire the wrappers are tested against. It is
+// mutex-guarded because a keep-alive loop writes to it from its own goroutine.
 type testTransport struct {
-	receiver func([]byte)
-	sent     []byte
+	mu        sync.Mutex
+	receiver  func([]byte)
+	sent      []byte
+	connected bool
 }
 
-func (t *testTransport) Start() error                  { return nil }
-func (t *testTransport) Stop() error                   { return nil }
-func (t *testTransport) IsConnected() bool             { return true }
-func (t *testTransport) Stats() TransportStats         { return TransportStats{} }
-func (t *testTransport) Receive(callback func([]byte)) { t.receiver = callback }
-func (t *testTransport) Send(data []byte) error        { t.sent = append([]byte(nil), data...); return nil }
+func (t *testTransport) Start() error          { return nil }
+func (t *testTransport) Stop() error           { return nil }
+func (t *testTransport) Stats() TransportStats { return TransportStats{} }
+
+func (t *testTransport) IsConnected() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.connected
+}
+
+func (t *testTransport) setConnected(connected bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.connected = connected
+}
+
+func (t *testTransport) Receive(callback func([]byte)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.receiver = callback
+}
+
+func (t *testTransport) Send(data []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sent = append([]byte(nil), data...)
+	return nil
+}
+
+// lastSent returns a copy of the most recent packet, or nil if none was sent.
+func (t *testTransport) lastSent() []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]byte(nil), t.sent...)
+}
+
 func (t *testTransport) deliver(data []byte) {
-	if t.receiver != nil {
-		t.receiver(data)
+	t.mu.Lock()
+	callback := t.receiver
+	t.mu.Unlock()
+	if callback != nil {
+		callback(data)
 	}
 }
 
@@ -40,10 +78,10 @@ func TestEncryptedTransportRoundTrip(t *testing.T) {
 	if err := client.Send(want); err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(clientWire.sent, want) {
+	if bytes.Contains(clientWire.lastSent(), want) {
 		t.Fatal("ciphertext contains plaintext")
 	}
-	exitWire.deliver(clientWire.sent)
+	exitWire.deliver(clientWire.lastSent())
 	if !bytes.Equal(got, want) {
 		t.Fatalf("received %q, want %q", got, want)
 	}
@@ -54,7 +92,7 @@ func TestEncryptedTransportRoundTrip(t *testing.T) {
 	if err := exitNode.Send(reply); err != nil {
 		t.Fatal(err)
 	}
-	clientWire.deliver(exitWire.sent)
+	clientWire.deliver(exitWire.lastSent())
 	if !bytes.Equal(got, reply) {
 		t.Fatalf("received %q, want %q", got, reply)
 	}
@@ -77,7 +115,7 @@ func TestEncryptedTransportRejectsWrongKeyTamperingAndReplay(t *testing.T) {
 	}
 	called := 0
 	wrongExit.Receive(func([]byte) { called++ })
-	wrongWire.deliver(wire.sent)
+	wrongWire.deliver(wire.lastSent())
 	if called != 0 {
 		t.Fatal("wrong key was accepted")
 	}
@@ -88,14 +126,14 @@ func TestEncryptedTransportRejectsWrongKeyTamperingAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	rightExit.Receive(func([]byte) { called++ })
-	tampered := append([]byte(nil), wire.sent...)
+	tampered := append([]byte(nil), wire.lastSent()...)
 	tampered[len(tampered)-1] ^= 1
 	rightWire.deliver(tampered)
 	if called != 0 {
 		t.Fatal("tampered packet was accepted")
 	}
-	rightWire.deliver(wire.sent)
-	rightWire.deliver(wire.sent)
+	rightWire.deliver(wire.lastSent())
+	rightWire.deliver(wire.lastSent())
 	if called != 1 {
 		t.Fatalf("replayed packet delivered %d times, want 1", called)
 	}

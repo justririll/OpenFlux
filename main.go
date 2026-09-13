@@ -65,6 +65,25 @@ func main() {
 	log.Printf("Mode: %s", map[bool]string{true: "EXIT NODE", false: "CLIENT"}[*exitNode])
 	log.Printf("Transport: %s", *transportType)
 
+	// --url accepts either a plain document URL or a ydocs:// link that also
+	// carries the shared encryption secret (ydocs://DOC_URL#SECRET). Both
+	// peers must be given the same link.
+	link, err := transport.ParseLink(globalDocUrl)
+	if err != nil {
+		log.Fatalf("Invalid --url: %v", err)
+	}
+	// An explicit key file wins over a secret embedded in the link, so an
+	// operator can keep the secret out of shell history and process lists.
+	if *encryptionKeyFile != "" {
+		secretBytes, err := os.ReadFile(*encryptionKeyFile)
+		if err != nil {
+			log.Fatalf("Read encryption key file: %v", err)
+		}
+		link.Secret = strings.TrimSpace(string(secretBytes))
+	}
+	// Downstream transports only ever see the clean document URL.
+	globalDocUrl = link.URL
+
 	config := transport.DefaultConfig()
 	var inner transport.Transport
 
@@ -80,27 +99,20 @@ func main() {
 		log.Fatalf("Unknown transport type: %s", *transportType)
 	}
 
-	if *encryptionKeyFile != "" {
-		secretBytes, err := os.ReadFile(*encryptionKeyFile)
-		if err != nil {
-			log.Fatalf("Read encryption key file: %v", err)
-		}
-		// The context is just a public KDF salt (domain separation between
-		// unrelated sessions using the same secret), not a secret itself -
-		// the document URL is a convenient, already-shared identifier.
-		context := *transportType
-		if globalDocUrl != "" {
-			context = globalDocUrl
-		}
-		encrypted, err := transport.NewEncryptedTransport(inner, strings.TrimSpace(string(secretBytes)), context, *exitNode)
-		if err != nil {
-			log.Fatalf("Configure encrypted transport: %v", err)
-		}
-		inner = encrypted
-		log.Printf("Transport encryption: AES-256-GCM enabled")
+	// Wrap encrypts (when the link carries a secret) and then compresses.
+	// The KDF context is the parsed document URL, so a ydocs:// link and a
+	// plain URL plus --encryption-key-file interoperate for the same doc.
+	trans, err := link.Wrap(inner, config, *transportType, *exitNode)
+	if err != nil {
+		log.Fatalf("Configure encrypted transport: %v", err)
 	}
-
-	trans := transport.NewCompressedTransport(inner)
+	if link.Encrypted() {
+		log.Printf("Transport encryption: AES-256-GCM enabled")
+	} else {
+		log.Printf("Transport encryption: DISABLED - the document provider sees your traffic in plaintext.")
+		log.Printf("  Enable it by giving both peers the same link: --url \"ydocs://%s#YOUR_SHARED_SECRET\"",
+			strings.TrimPrefix(strings.TrimPrefix(globalDocUrl, "https://"), "http://"))
+	}
 
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)

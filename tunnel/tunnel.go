@@ -25,6 +25,10 @@ type TCPTunnel struct {
 	rawEP       *RawSocketEndpoint
 	startTime   time.Time
 	packetCount atomic.Uint64
+
+	// droppedPackets counts packets the transport refused (full write queue,
+	// or no connection). These used to vanish silently.
+	droppedPackets atomic.Uint64
 }
 
 // TCP buffer size range for gvisor stacks. Big by default (exit node on a VPS);
@@ -64,9 +68,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
         SetTCPBuffers(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
-	tunnelEP.onOutgoingPacket = func(data []byte) {
-		trans.Send(data)
-	}
+	tunnelEP.onOutgoingPacket = t.sendToTransport
 	t.tunnelEP = tunnelEP
 
 	tunnelNIC := tcpip.NICID(1)
@@ -99,9 +101,7 @@ func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
 	}
 
 	t.rawEP = rawEP
-	rawEP.SetTransportSender(func(data []byte) {
-		t.transport.Send(data)
-	})
+	rawEP.SetTransportSender(t.sendToTransport)
 
 	internetNIC := tcpip.NICID(2)
 	if err := t.gvisorStack.CreateNIC(internetNIC, rawEP); err != nil {
@@ -185,15 +185,31 @@ func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
 	}, ipv4.ProtocolNumber)
 }
 
+// sendToTransport hands one packet to the transport, counting refusals. The
+// error used to be discarded at both call sites, so a full write queue or a
+// disconnected transport dropped packets with no trace: the tunnel looked
+// healthy in the logs while nothing was actually getting through.
+func (t *TCPTunnel) sendToTransport(data []byte) {
+	if err := t.transport.Send(data); err != nil {
+		n := t.droppedPackets.Add(1)
+		// First drop, then every hundredth: enough to spot an outage without
+		// flooding the log during one.
+		if n == 1 || n%100 == 0 {
+			utils.Debugf("[TUNNEL] transport send failed (%d dropped so far): %v", n, err)
+		}
+	}
+}
+
 func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		stats := t.gvisorStack.Stats()
-		utils.Debugf("[STATS] uptime=%v packets=%d connected=%d established=%d retrans=%d",
+		utils.Debugf("[STATS] uptime=%v packets=%d dropped=%d connected=%d established=%d retrans=%d",
 			time.Since(t.startTime).Round(time.Second),
 			t.packetCount.Load(),
+			t.droppedPackets.Load(),
 			stats.TCP.CurrentConnected.Value(),
 			stats.TCP.CurrentEstablished.Value(),
 			stats.TCP.Retransmits.Value(),
@@ -205,20 +221,39 @@ func (t *TCPTunnel) printStats() {
 // IP (both for source rewriting and the return-packet filter). Point it at a
 // dedicated alias IP so the RST-drop iptables rule can be scoped with
 // `-s <ip>` instead of dropping RSTs host-wide.
-var localIPOverride string
+var localIPOverride atomic.Value // string
+
+// cachedLocalIP memoizes the auto-detected egress IP.
+var cachedLocalIP atomic.Value // string
+
+// fallbackLocalIP is used only when the address cannot be discovered at all.
+const fallbackLocalIP = "192.168.1.100"
 
 // SetLocalIP overrides the auto-detected egress IP for the exit node.
-func SetLocalIP(ip string) { localIPOverride = ip }
+func SetLocalIP(ip string) { localIPOverride.Store(ip) }
 
+// getLocalIP returns the exit node's egress IP.
+//
+// The result is cached because the raw socket calls this for every packet in
+// both directions, and the discovery path opens and closes a UDP socket to
+// learn the address. One socket per packet was enough syscall and fd churn to
+// hurt an exit node under sustained load.
 func getLocalIP() string {
-	if localIPOverride != "" {
-		return localIPOverride
+	if ip, ok := localIPOverride.Load().(string); ok && ip != "" {
+		return ip
 	}
+	if ip, ok := cachedLocalIP.Load().(string); ok && ip != "" {
+		return ip
+	}
+
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
-		return "192.168.1.100"
+		// Deliberately not cached: a transient failure must not pin the
+		// wrong address for the lifetime of the process.
+		return fallbackLocalIP
 	}
 	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	ip := conn.LocalAddr().(*net.UDPAddr).IP.String()
+	cachedLocalIP.Store(ip)
+	return ip
 }

@@ -120,6 +120,7 @@ const (
 	startTransportError = 3
 	startAddrInUse      = 4 // SOCKS5 port could not be bound (e.g. already in use)
 	startPanic          = 5
+	startBadLink        = 6 // malformed ydocs:// link (bad URL, or secret too short)
 )
 
 // OpenFluxStartClient starts the SOCKS5 client tunnel.
@@ -163,17 +164,38 @@ func OpenFluxStartClient(transportType, url, socksAddr, maxToken, maxUid *C.char
 	}
 	probe.Close()
 
+	// The URL field doubles as an OpenFlux link: a plain document URL keeps
+	// the old unencrypted behaviour, while ydocs://DOC_URL#SECRET turns on
+	// AES-256-GCM with no other change needed from the app.
+	link, err := transport.ParseLink(docURL)
+	if err != nil {
+		utils.Debugf("[BRIDGE] Bad link: %v", err)
+		return C.int(startBadLink)
+	}
+	docURL = link.URL
+
 	config := transport.DefaultConfig()
-	var t transport.Transport
+	var inner transport.Transport
 	switch tt {
 	case "yandex", "":
-		t = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(docURL, config))
+		inner = yandex.NewYandexDocsTransport(docURL, config)
 	case "oneme":
 		uidint, _ := strconv.ParseInt(mUid, 10, 64)
-		t = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, mToken, uidint, config))
+		inner = oneme.NewOneMeTransport(false, mToken, uidint, config)
 	default:
 		utils.Debugf("[BRIDGE] Unknown transport type: %s", tt)
 		return C.int(startBadTransport)
+	}
+
+	t, err := link.Wrap(inner, config, tt, false)
+	if err != nil {
+		utils.Debugf("[BRIDGE] Encryption setup failed: %v", err)
+		return C.int(startBadLink)
+	}
+	if link.Encrypted() {
+		utils.Debugf("[BRIDGE] Transport encryption: AES-256-GCM enabled")
+	} else {
+		utils.Debugf("[BRIDGE] Transport encryption: DISABLED (plaintext to the document provider)")
 	}
 
 	if err := t.Start(); err != nil {
