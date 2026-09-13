@@ -130,7 +130,9 @@ func TestLinkWrapPairsClientAndExitNode(t *testing.T) {
 	var got []byte
 	exit.Receive(func(b []byte) { got = append([]byte(nil), b...) })
 
-	payload := []byte("hello through the document")
+	// A real payload: the stack only forwards IPv4 packets, so the first
+	// byte must carry version 4 in its high nibble.
+	payload := append([]byte{0x45, 0x00, 0x00, 0x1c}, []byte("hello through the document")...)
 	if err := client.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -157,7 +159,7 @@ func TestLinkWrapWithoutSecretIsPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wrap: %v", err)
 	}
-	payload := []byte("this small packet is not compressed")
+	payload := append([]byte{0x45, 0x00, 0x00, 0x1c}, []byte("this small packet is not compressed")...)
 	if err := stack.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}

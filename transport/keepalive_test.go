@@ -18,8 +18,8 @@ func TestKeepAliveTransportRoundTripsData(t *testing.T) {
 	if err := ka.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if wire.lastSent()[0] != frameData {
-		t.Errorf("wire byte 0 = %#x, want the data frame %#x", wire.lastSent()[0], frameData)
+	if !bytes.Equal(wire.lastSent(), payload) {
+		t.Errorf("packet was altered on the wire: %#v, want %#v", wire.lastSent(), payload)
 	}
 
 	wire.deliver(wire.lastSent())
@@ -42,9 +42,9 @@ func TestKeepAliveFramesAreDropped(t *testing.T) {
 	}
 }
 
-// A peer on an older build sends unframed IPv4 packets. Those must still be
-// delivered: an IPv4 header never starts with a frame byte.
-func TestUnframedLegacyPacketPassesThrough(t *testing.T) {
+// Real packets are forwarded byte for byte in both directions, so a peer on
+// an older build interoperates without changes.
+func TestLegacyPacketPassesThrough(t *testing.T) {
 	wire := &testTransport{}
 	ka := NewKeepAliveTransport(wire, 0)
 
@@ -81,8 +81,11 @@ func TestKeepAlivePacketsVary(t *testing.T) {
 	bodies := make(map[string]bool)
 	for i := 0; i < 64; i++ {
 		p := ka.keepAlivePacket()
-		if p[0] != frameKeepAlive {
-			t.Fatalf("byte 0 = %#x, want the keep-alive frame %#x", p[0], frameKeepAlive)
+		if p[0] != keepAliveTag {
+			t.Fatalf("byte 0 = %#x, want the keep-alive tag %#x", p[0], keepAliveTag)
+		}
+		if p[0]>>4 == ipv4Version {
+			t.Fatalf("keep-alive %#v could be mistaken for an IPv4 packet", p)
 		}
 		if len(p) > keepAlivePadMax+1 {
 			t.Fatalf("keep-alive is %d bytes, over the %d cap", len(p), keepAlivePadMax+1)
@@ -127,8 +130,8 @@ func TestKeepAliveLoopEmitsOnlyWhileConnected(t *testing.T) {
 	if wire.lastSent() == nil {
 		t.Fatal("no keep-alive after the transport came up")
 	}
-	if wire.lastSent()[0] != frameKeepAlive {
-		t.Errorf("byte 0 = %#x, want the keep-alive frame %#x", wire.lastSent()[0], frameKeepAlive)
+	if wire.lastSent()[0] != keepAliveTag {
+		t.Errorf("byte 0 = %#x, want the keep-alive frame %#x", wire.lastSent()[0], keepAliveTag)
 	}
 }
 

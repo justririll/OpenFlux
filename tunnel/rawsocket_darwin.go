@@ -38,6 +38,12 @@ const (
 	// sweepInterval is how often expired tracking entries are reaped.
 	sweepInterval = time.Minute
 
+	// rawRecvBufBytes is the receive buffer requested for the raw socket.
+	// Every raw TCP socket on the host gets a copy of every TCP packet, so
+	// with several exit nodes on one machine the default (208KB on Linux)
+	// overflows in bursts and the kernel silently discards tunnel traffic.
+	rawRecvBufBytes = 8 << 20
+
 	// maxConsecutiveReadErrors bounds how long the reader keeps retrying a
 	// raw socket that only ever returns errors, so a genuinely dead fd does
 	// not become a hot spin loop.
@@ -83,6 +89,8 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 		return nil, fmt.Errorf("bind failed: %v", err)
 	}
 
+	setLargeRecvBuffer(recvFd, nicID)
+
 	ep := &RawSocketEndpoint{
 		sendFd: sendFd,
 		recvFd: recvFd,
@@ -92,6 +100,15 @@ func NewRawSocketEndpoint(nicID tcpip.NICID) (*RawSocketEndpoint, error) {
 	go ep.readLoop()
 	go ep.sweepLoop()
 	return ep, nil
+}
+
+// setLargeRecvBuffer grows the raw socket's receive buffer. Dropped packets
+// here are invisible - the kernel just discards them and the tunnel sees
+// unexplained loss - so this is worth doing even when it only partly succeeds.
+func setLargeRecvBuffer(fd int, nicID tcpip.NICID) {
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, rawRecvBufBytes); err != nil {
+		utils.Debugf("[RAW-NIC%d] Could not grow the receive buffer: %v", nicID, err)
+	}
 }
 
 func (e *RawSocketEndpoint) SetTransportSender(sendFunc func([]byte)) {

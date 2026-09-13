@@ -133,7 +133,18 @@ type volgaAuth struct {
 	TS          string
 	SessionID   string
 	Cookies     []*http.Cookie
+
+	// VolgaOrigin and PushURL are read from the authorization response
+	// rather than hardcoded. A document opened on disk.yandex.com
+	// authorizes against volga.yandex.com, and posting its relay traffic to
+	// volga.yandex.ru is a different origin: the session does not apply
+	// there and every relay POST comes back 401.
+	VolgaOrigin string
+	PushURL     string
 }
+
+// defaultPushURL is used when the authorization response omits the xiva URL.
+const defaultPushURL = "https://push.yandex.ru/v2"
 
 func authorize(docURL string) (*volgaAuth, error) {
 	utils.Debugf("[VOLGA] authorize(%s)", docURL)
@@ -261,7 +272,7 @@ func authorize(docURL string) (*volgaAuth, error) {
 	req2, _ := http.NewRequest("POST", actionURL, strings.NewReader(body))
 	req2.Header.Set("User-Agent", volgaUserAgent)
 	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req2.Header.Set("Origin", "https://disk.yandex.ru")
+	req2.Header.Set("Origin", originOf(finalURL, "https://disk.yandex.ru"))
 	req2.Header.Set("Referer", finalURL)
 	req2.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req2.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
@@ -318,10 +329,18 @@ func authorize(docURL string) (*volgaAuth, error) {
 	a.SessionID = getStr(jsonData, "sessionId")
 	a.UserID = int(getFloat(jsonData, "userId"))
 
+	// The redirect lands on the volga host this document belongs to, which
+	// is the only host its session is valid for.
+	a.VolgaOrigin = locParsed.Scheme + "://" + locParsed.Host
+
+	a.PushURL = defaultPushURL
 	if xiva, ok := jsonData["xiva"].(map[string]interface{}); ok {
 		a.Sign = getStr(xiva, "sign")
 		a.TS = getStr(xiva, "ts")
 		a.UserIDStr = getStr(xiva, "user")
+		if pushURL := getStr(xiva, "url"); pushURL != "" {
+			a.PushURL = pushURL
+		}
 	}
 
 	req3, _ := http.NewRequest("GET", location, nil)
@@ -342,9 +361,41 @@ func authorize(docURL string) (*volgaAuth, error) {
 			a.Token != "", a.RequestPath != "", a.UserIDStr != "", a.Sign != "")
 	}
 
-	utils.Debugf("[VOLGA] auth OK: user=%d(%s) rp=%s sign=%s ts=%s",
-		a.UserID, a.UserIDStr, a.RequestPath, a.Sign, a.TS)
+	utils.Debugf("[VOLGA] auth OK: user=%d(%s) rp=%s sign=%s ts=%s origin=%s push=%s",
+		a.UserID, a.UserIDStr, a.RequestPath, a.Sign, a.TS, a.VolgaOrigin, a.PushURL)
 	return a, nil
+}
+
+// volgaOrigin is the scheme://host the session was issued for, falling back
+// to the .ru host for sessions established before it was recorded.
+func (a *volgaAuth) volgaOrigin() string {
+	if a.VolgaOrigin != "" {
+		return a.VolgaOrigin
+	}
+	return "https://volga.yandex.ru"
+}
+
+// pushWebsocketBase turns the advertised xiva URL into its WebSocket endpoint.
+func (a *volgaAuth) pushWebsocketBase() string {
+	base := a.PushURL
+	if base == "" {
+		base = defaultPushURL
+	}
+	if rest, ok := strings.CutPrefix(base, "https://"); ok {
+		base = "wss://" + rest
+	} else if rest, ok := strings.CutPrefix(base, "http://"); ok {
+		base = "ws://" + rest
+	}
+	return strings.TrimSuffix(base, "/") + "/subscribe/websocket"
+}
+
+// originOf reduces a URL to scheme://host, or returns fallback if it cannot.
+func originOf(rawURL, fallback string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fallback
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 func getStr(m map[string]interface{}, key string) string {
@@ -630,7 +681,7 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 	copy(bodyCopy, buf.Bytes())
 	jsonBufPool.Put(buf)
 
-	urlStr := fmt.Sprintf("https://volga.yandex.ru/session/main/%s/relay", r.auth.RequestPath)
+	urlStr := fmt.Sprintf("%s/session/main/%s/relay", r.auth.volgaOrigin(), r.auth.RequestPath)
 	req, err := http.NewRequestWithContext(r.ctx, "POST", urlStr, bytes.NewReader(bodyCopy))
 	if err != nil {
 		return err
@@ -638,8 +689,8 @@ func (r *relayClient) sendBatch(batch [][]byte) error {
 	req.Header.Set("User-Agent", volgaUserAgent)
 	req.Header.Set("Authorization", "Bearer "+r.auth.Token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://volga.yandex.ru")
-	req.Header.Set("Referer", "https://volga.yandex.ru/document/?request-path="+r.auth.RequestPath)
+	req.Header.Set("Origin", r.auth.volgaOrigin())
+	req.Header.Set("Referer", r.auth.volgaOrigin()+"/document/?request-path="+r.auth.RequestPath)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
@@ -753,7 +804,7 @@ func (w *wsListener) run() {
 }
 
 func (w *wsListener) connect() error {
-	wsURL := "wss://push.yandex.ru/v2/subscribe/websocket?" +
+	wsURL := w.auth.pushWebsocketBase() + "?" +
 		"service=volga" +
 		"&user=" + url.QueryEscape(w.auth.UserIDStr) +
 		"&sign=" + w.auth.Sign +
@@ -765,7 +816,7 @@ func (w *wsListener) connect() error {
 
 	header := http.Header{}
 	header.Set("User-Agent", volgaUserAgent)
-	header.Set("Origin", "https://volga.yandex.ru")
+	header.Set("Origin", w.auth.volgaOrigin())
 
 	var cookieParts []string
 	for _, c := range w.auth.Cookies {

@@ -9,10 +9,15 @@ import (
 )
 
 const (
-	// frameData marks a packet carrying a real tunnelled IPv4 packet.
-	frameData = byte(0x00)
-	// frameKeepAlive marks a packet the peer discards on arrival.
-	frameKeepAlive = byte(0x01)
+	// ipv4Version is the value of the high nibble of an IPv4 header's first
+	// byte. Every packet the tunnel carries is IPv4 (the stack is built with
+	// only ipv4.NewProtocol, and the client refuses IPv6), so that nibble
+	// tells a real packet apart from a keep-alive with no framing of its own.
+	ipv4Version = 4
+
+	// keepAliveTag is the first byte of a keep-alive. Any value whose high
+	// nibble is not 4 works; 0x00 can never begin an IPv4 header.
+	keepAliveTag = byte(0x00)
 
 	// keepAlivePadMax bounds the random padding on a keep-alive, so keep-alives
 	// do not stand out from real traffic by having one constant length.
@@ -26,8 +31,12 @@ const (
 // The keep-alive used to be emitted by the transport itself, below both
 // layers, as a fixed marker string. That put a constant, unencrypted token on
 // the wire at a fixed interval - a reliable fingerprint of the tunnel that
-// survived turning encryption on. Framing it here means an observer sees only
-// another opaque packet.
+// survived turning encryption on. Here it is just another opaque packet.
+//
+// Real packets are forwarded byte for byte, with no framing added, so a peer
+// running an older build interoperates in both directions: it still receives
+// exactly the packets it expects, and this side still understands everything
+// it sends.
 type KeepAliveTransport struct {
 	Transport
 
@@ -37,7 +46,7 @@ type KeepAliveTransport struct {
 }
 
 // NewKeepAliveTransport wraps inner. A non-positive interval disables the
-// keep-alive but still applies the framing, which both peers must agree on.
+// keep-alive but leaves the receive-side filtering in place.
 func NewKeepAliveTransport(inner Transport, interval time.Duration) *KeepAliveTransport {
 	return &KeepAliveTransport{
 		Transport: inner,
@@ -61,30 +70,21 @@ func (k *KeepAliveTransport) Stop() error {
 	return k.Transport.Stop()
 }
 
+// Send forwards the packet untouched. Adding a frame byte here would be
+// tidier, but it would also break every peer that has not been upgraded yet.
 func (k *KeepAliveTransport) Send(data []byte) error {
-	framed := make([]byte, 0, len(data)+1)
-	framed = append(framed, frameData)
-	framed = append(framed, data...)
-	return k.Transport.Send(framed)
+	return k.Transport.Send(data)
 }
 
 func (k *KeepAliveTransport) Receive(callback func([]byte)) {
 	k.Transport.Receive(func(packet []byte) {
-		if len(packet) == 0 {
+		// Anything that is not an IPv4 header is either one of our
+		// keep-alives or corruption. Both are dropped rather than handed to
+		// the network stack.
+		if len(packet) == 0 || packet[0]>>4 != ipv4Version {
 			return
 		}
-		switch packet[0] {
-		case frameKeepAlive:
-			return
-		case frameData:
-			callback(packet[1:])
-		default:
-			// An unframed packet comes from a peer running an older build.
-			// An IPv4 header always starts with 0x45 or higher (version 4 in
-			// the high nibble), so it can never be mistaken for a frame byte
-			// and it is safe to pass straight through.
-			callback(packet)
-		}
+		callback(packet)
 	})
 }
 
@@ -108,8 +108,8 @@ func (k *KeepAliveTransport) loop() {
 	}
 }
 
-// keepAlivePacket builds one keep-alive: the frame byte plus a random amount
-// of random padding, so neither its contents nor its length repeat.
+// keepAlivePacket builds one keep-alive: the tag byte plus a random amount of
+// random padding, so neither its contents nor its length repeat.
 func (k *KeepAliveTransport) keepAlivePacket() []byte {
 	var sizePick [1]byte
 	if _, err := rand.Read(sizePick[:]); err != nil {
@@ -120,5 +120,5 @@ func (k *KeepAliveTransport) keepAlivePacket() []byte {
 		// Padding is cosmetic; an empty keep-alive still does its job.
 		padding = nil
 	}
-	return append([]byte{frameKeepAlive}, padding...)
+	return append([]byte{keepAliveTag}, padding...)
 }

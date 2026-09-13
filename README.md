@@ -46,9 +46,10 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 ## Overview
 
-TCP packets are sent via Transport. Currently, there are two transports available:
-1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets via WebRTC DataChannel
+TCP packets are sent via Transport. Currently, there are three transports available:
+1. Yandex (`--transport yandex`) - sends packets via Yandex Docs cursor messages, using the **legacy** document editor;
+2. Volga (`--transport vyandex`) - the same idea on the **new** editor, relaying packets through the Volga session API. Pick this one for documents that open in the new editor. Both `disk.yandex.ru` and `disk.yandex.com` links work; the session is bound to whichever host the document belongs to;
+3. Max (`--transport oneme`) - sends packets via WebRTC DataChannel
     WARNING:
    - **Do not use** your primary or important MAX account.
    - **Do not use** an account whose deletion or loss of access would be critical.   
@@ -143,11 +144,11 @@ Then set up SOCKS5 proxy in your browser at localhost:1080.
 
 ## Encryption
 
-> **Upgrade both peers together.** This build tags every packet with a one-byte
-> frame so the keep-alive travels through the same compression and encryption
-> as real traffic instead of being a constant plaintext marker. A peer on an
-> older build does not understand that tag, so the client and the exit node
-> must be updated at the same time.
+> **Compatible with older peers.** The keep-alive now travels through the same
+> compression and encryption as real traffic instead of being a constant
+> plaintext marker, but real packets are forwarded byte for byte. A client and
+> an exit node on different builds still talk to each other, so you can update
+> one side at a time. Turning encryption *on*, of course, requires both.
 
 The transport itself carries your packets as base64 inside document messages.
 The hops to the provider are TLS, so your ISP and the local network see
@@ -191,6 +192,77 @@ Details:
   plus `--encryption-key-file /path/to/secret`. The two forms interoperate:
   a peer using the key file and a peer using a `ydocs://` link derive the same
   keys as long as the document URL and the secret match.
+
+## Running several exit nodes on one VPS
+
+One exit node per document link. They coexist on a single IP, but a few
+details decide whether that works well or badly.
+
+Give each link its own systemd instance, with its own environment file:
+
+```ini
+# /etc/systemd/system/openflux-exit@.service
+[Unit]
+Description=OpenFlux exit node (%i)
+Wants=network-online.target
+After=network-online.target openflux-rst-drop.service
+Requires=openflux-rst-drop.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/openflux/instances/%i.env
+ExecStart=/usr/local/bin/openflux --exit-node --transport ${TRANSPORT} --url ${YANDEX_DOC_URL} $EXTRA_ARGS
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+# /etc/openflux/instances/phone.env
+TRANSPORT=vyandex
+YANDEX_DOC_URL=https://disk.yandex.com/i/YOUR_DOC
+EXTRA_ARGS=
+```
+
+```bash
+sudo systemctl enable --now openflux-exit@phone.service
+```
+
+Taking `TRANSPORT` from the instance file rather than the unit lets different
+links use different transports on the same box.
+
+### Watch the raw socket drop counter
+
+Each exit node opens a raw TCP socket, and **every** raw TCP socket on the host
+receives a copy of **every** TCP packet - the other instances' tunnels, SSH,
+everything else. Each instance filters out what is not its own, but it has to
+read the packet to do that. If an instance cannot drain its socket fast enough,
+the kernel discards the overflow silently: no error, no log, just unexplained
+loss inside the tunnel.
+
+That counter is the first thing to check when several links "work badly":
+
+```bash
+grep ":0006" /proc/net/raw | awk '{print "drops=" $NF}'
+```
+
+One line per exit node, and the last column is a cumulative drop count. It
+should stay at or near zero. If it climbs, the exit nodes are not keeping up.
+
+Two changes keep it there:
+
+- The egress IP is resolved once instead of per packet. It used to be
+  rediscovered for every packet in both directions, and discovery opens and
+  closes a UDP socket, so the cost scaled with traffic and with the number of
+  instances.
+- The raw receive buffer is raised to 8MB, well above the 208KB default, to
+  absorb bursts.
+
+If drops still climb, the box is simply out of headroom: run fewer instances
+per host, or give each one a dedicated egress IP with `--local-ip` so the
+kernel hands it less to sift through.
 
 ## Flags
 
