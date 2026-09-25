@@ -107,6 +107,24 @@ export XCODE_PATH="<your Xcode.app path>" # optional, defaults to /Applications/
 ### 1. Setting up exit node
 1. You must have root access on exit node machine;
 2. Only legacy Yandex document editor is supported (you can toggle this setting from the interface).
+3. Install a headless Chrome for the Yandex transports. Yandex now puts a
+   JavaScript anti-bot check (`showcaptchafast`) in front of every document
+   fetch; the binary clears it by loading the document once in Chrome and
+   reusing its cookies. It looks on `PATH` for `chrome-headless-shell`,
+   `google-chrome` or `chromium` (override with `--browser /path/to/chrome`,
+   disable with `--browser off`). The smallest option is Chrome for Testing's
+   `chrome-headless-shell`:
+   ```bash
+   V=$(curl -s https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json \
+       | python3 -c 'import json,sys;print(json.load(sys.stdin)["channels"]["Stable"]["version"])')
+   curl -sSfLo /tmp/chs.zip https://storage.googleapis.com/chrome-for-testing-public/$V/linux64/chrome-headless-shell-linux64.zip
+   sudo apt-get install -y unzip libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libxkbcommon0 \
+       libgbm1 libasound2t64 libxcomposite1 libxdamage1 libxrandr2 libpango-1.0-0 libcairo2 libxfixes3 libdrm2
+   sudo unzip -q /tmp/chs.zip -d /opt
+   sudo ln -sf /opt/chrome-headless-shell-linux64/chrome-headless-shell /usr/local/bin/
+   ```
+   On startup the log says `Anti-bot solver: <path>`; each check it clears logs
+   `[CAPTCHA] cleared in ...`.
 
 The exit node's TCP connections live in a userspace stack (gvisor), so the
 kernel has no socket for them and would send an RST on every reply, tearing

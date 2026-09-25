@@ -13,6 +13,7 @@ import (
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
+	"universal-bypass-tool/transport/yandex/chromesolver"
 	"universal-bypass-tool/tunnel"
 	"universal-bypass-tool/utils"
 )
@@ -40,6 +41,8 @@ func main() {
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
+	browser := flag.String("browser", "auto",
+		"Chrome/Chromium used to clear Yandex's anti-bot check: a path, \"auto\" to look on PATH, or \"off\"")
 	flag.Parse()
 
 	if localIP != "" {
@@ -88,6 +91,8 @@ func main() {
 	}
 	// Downstream transports only ever see the clean document URL.
 	globalDocUrl = link.URL
+
+	installCaptchaSolver(*browser)
 
 	config := transport.DefaultConfig()
 	var inner transport.Transport
@@ -145,4 +150,24 @@ func main() {
 		socks5Server := socks5.NewSOCKS5Server(*socksAddr, tun)
 		log.Fatal(socks5Server.Start())
 	}
+}
+
+// installCaptchaSolver hands the Yandex transports a headless Chrome to clear
+// the anti-bot check that now fronts every document fetch. Without one the
+// transport can only log the captcha URL and wait for a human.
+func installCaptchaSolver(browser string) {
+	if browser == "off" {
+		return
+	}
+	path := browser
+	if browser == "auto" {
+		p, err := chromesolver.Find()
+		if err != nil {
+			log.Printf("Anti-bot solver: disabled (%v); install Chrome or pass --browser", err)
+			return
+		}
+		path = p
+	}
+	yandex.SetCaptchaSolver(chromesolver.New(path))
+	log.Printf("Anti-bot solver: %s", path)
 }

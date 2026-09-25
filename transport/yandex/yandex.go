@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -70,6 +71,14 @@ const (
 	// writerIdleWake bounds how long the writer parks on an empty queue, so
 	// it notices Stop promptly.
 	writerIdleWake = 500 * time.Millisecond
+
+	// captchaHoldDelay is how long the transport waits after Yandex answers a
+	// document fetch with an anti-bot captcha before trying again. Each fetch
+	// gets a *fresh* challenge, so retrying every second would spin new captcha
+	// URLs faster than a person can solve one. Holding keeps the surfaced URL
+	// the current, solvable challenge; once the user clears it (same IP), the
+	// next attempt goes through.
+	captchaHoldDelay = 15 * time.Second
 )
 
 type DocSession struct {
@@ -420,7 +429,36 @@ func reconnectBackoff(n int) time.Duration {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
+	info, captchaURL, err := t.fetchDocInfoOnce(url, userID)
+	if captchaURL == "" {
+		return info, err
+	}
+	// Try to clear the anti-bot check in a browser and go again right away.
+	if solveCaptcha(url) {
+		info, captchaURL, err = t.fetchDocInfoOnce(url, userID)
+		if captchaURL == "" {
+			return info, err
+		}
+	}
+
+	// No solver, or the pass did not stick. Only a human can clear it now, so
+	// surface the URL -- logged unconditionally with a marker the app watches
+	// for and opens -- then hold before the next attempt so this same
+	// challenge stays solvable rather than a fresh one being spun every retry.
+	log.Printf("[CAPTCHA] %s", captchaURL)
+	select {
+	case <-time.After(captchaHoldDelay):
+	case <-t.stopped:
+	}
+	return YandexDocsInfo{}, fmt.Errorf("captcha required (open the surfaced link and solve it)")
+}
+
+// fetchDocInfoOnce fetches the document page once. When Yandex answers with
+// its anti-bot page instead, it returns that page's URL and no error.
+func (t *YandexDocsTransport) fetchDocInfoOnce(url, userID string) (YandexDocsInfo, string, error) {
 	client := &http.Client{
+		// Offers the browser's pass cookies (if any) on every redirect hop.
+		Jar: newPassAwareJar(),
 		// Cap redirects so an auth/login redirect loop fails fast instead of
 		// hanging until the timeout (a private doc redirects to passport).
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -434,16 +472,27 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	utils.Debugf("[YDOCS] fetchDocInfo GET %s", url)
 	req, _ := http.NewRequest("GET", url, nil)
+	// Keep this minimal on purpose: a full browser User-Agent trips Yandex's
+	// anti-bot (it answers with a showcaptcha page); the bare token is served
+	// the real document page with client-config intact.
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return YandexDocsInfo{}, err
+		return YandexDocsInfo{}, "", err
 	}
 	defer resp.Body.Close()
 
 	htmlBytes, _ := io.ReadAll(resp.Body)
 	html := string(htmlBytes)
-	utils.Debugf("[YDOCS] response status=%d finalURL=%s body=%dB", resp.StatusCode, resp.Request.URL.String(), len(html))
+	finalURL := resp.Request.URL.String()
+	utils.Debugf("[YDOCS] response status=%d finalURL=%s body=%dB", resp.StatusCode, finalURL, len(html))
+
+	// Yandex fronts the document with a JavaScript anti-bot check; without a
+	// pass cookie the fetch lands on its captcha page. The caller decides
+	// whether to clear it in a browser or surface it.
+	if isCaptchaURL(finalURL) {
+		return YandexDocsInfo{}, finalURL, nil
+	}
 
 	var cookies []string
 	for _, c := range resp.Cookies() {
@@ -458,43 +507,43 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		if strings.Contains(html, "passport") || strings.Contains(strings.ToLower(html), "login") {
 			hint = "looks like a login page (doc not public?)"
 		}
-		return YandexDocsInfo{}, fmt.Errorf("config not found: %s (status %d, final %s)", hint, resp.StatusCode, resp.Request.URL.String())
+		return YandexDocsInfo{}, "", fmt.Errorf("config not found: %s (status %d, final %s)", hint, resp.StatusCode, resp.Request.URL.String())
 	}
 
 	var config map[string]interface{}
 	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
-		return YandexDocsInfo{}, fmt.Errorf("client-config is not valid JSON: %w", err)
+		return YandexDocsInfo{}, "", fmt.Errorf("client-config is not valid JSON: %w", err)
 	}
 
 	officeAction, ok := config["officeActionData"].(map[string]interface{})
 	if !ok || officeAction == nil {
-		return YandexDocsInfo{}, fmt.Errorf("officeActionData missing - will reconnect")
+		return YandexDocsInfo{}, "", fmt.Errorf("officeActionData missing - will reconnect")
 	}
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
 	if !ok || editorConfigRaw == nil {
-		return YandexDocsInfo{}, fmt.Errorf("editor_config nil - will reconnect")
+		return YandexDocsInfo{}, "", fmt.Errorf("editor_config nil - will reconnect")
 	}
 
 	balancerURL, ok := officeAction["balancer_url"].(string)
 	if !ok || balancerURL == "" {
-		return YandexDocsInfo{}, fmt.Errorf("officeActionData.balancer_url missing - will reconnect")
+		return YandexDocsInfo{}, "", fmt.Errorf("officeActionData.balancer_url missing - will reconnect")
 	}
 	host := strings.TrimPrefix(balancerURL, "https://")
 
 	document, ok := editorConfigRaw["document"].(map[string]interface{})
 	if !ok || document == nil {
-		return YandexDocsInfo{}, fmt.Errorf("editor_config.document missing - will reconnect")
+		return YandexDocsInfo{}, "", fmt.Errorf("editor_config.document missing - will reconnect")
 	}
 
 	token, ok := editorConfigRaw["token"].(string)
 	if !ok || token == "" {
-		return YandexDocsInfo{}, fmt.Errorf("editor_config.token missing - will reconnect")
+		return YandexDocsInfo{}, "", fmt.Errorf("editor_config.token missing - will reconnect")
 	}
 
 	docKey, ok := document["key"].(string)
 	if !ok || docKey == "" {
-		return YandexDocsInfo{}, fmt.Errorf("editor_config.document.key missing - will reconnect")
+		return YandexDocsInfo{}, "", fmt.Errorf("editor_config.document.key missing - will reconnect")
 	}
 
 	perms, _ := document["permissions"].(map[string]interface{})
@@ -519,7 +568,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 			"title":  document["title"],
 			"lcid":   25,
 		},
-	}, nil
+	}, "", nil
 }
 
 func randUserID() string {

@@ -8,12 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"runtime"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,7 +110,12 @@ func DefaultVolgaConfig() VolgaConfig {
 	}
 }
 
-const volgaUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+// A full browser User-Agent from a datacenter IP trips Yandex's anti-bot and
+// gets a showcaptcha page instead of the document; the bare token is served the
+// real page with client-config intact. Verified with curl from the exit node:
+// Firefox/153 and the real Firefox/133 both -> captcha; "Mozilla/5.0" -> OK.
+// So keep this deliberately minimal -- do NOT "upgrade" it to a realistic UA.
+const volgaUserAgent = "Mozilla/5.0"
 
 var reClientConfig = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 
@@ -180,10 +185,26 @@ type volgaAuth struct {
 // defaultPushURL is used when the authorization response omits the xiva URL.
 const defaultPushURL = "https://push.yandex.ru/v2"
 
+// authorize fetches the document page and trades its client-config for a
+// Volga session. If Yandex's anti-bot check gets in the way, it is cleared in
+// a browser when a CaptchaSolver is installed, else surfaced as [CAPTCHA].
 func authorize(docURL string) (*volgaAuth, error) {
+	a, captchaURL, err := authorizeOnce(docURL)
+	if captchaURL != "" && solveCaptcha(docURL) {
+		a, captchaURL, err = authorizeOnce(docURL)
+	}
+	if captchaURL != "" {
+		log.Printf("[CAPTCHA] %s", captchaURL)
+		return nil, fmt.Errorf("captcha required (open the surfaced link and solve it)")
+	}
+	return a, err
+}
+
+func authorizeOnce(docURL string) (*volgaAuth, string, error) {
 	utils.Debugf("[VOLGA] authorize(%s)", docURL)
 
-	jar, _ := cookiejar.New(nil)
+	// Offers the browser's pass cookies (if any) on every hop.
+	jar := newPassAwareJar()
 	session := &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
@@ -204,15 +225,16 @@ func authorize(docURL string) (*volgaAuth, error) {
 	for i := 0; i < 10; i++ {
 		req, _ := http.NewRequest("GET", currentURL, nil)
 		req.Header.Set("User-Agent", volgaUserAgent)
-		req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		// No browser-style Accept/Accept-Language here: with them Yandex's
+		// anti-bot rejects even a valid pass cookie and re-serves the captcha
+		// (verified); fetchDocInfo sends neither and gets through.
 		if i > 0 {
 			req.Header.Set("Referer", docURL)
 		}
 
 		resp, err := session.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("GET %s: %w", currentURL, err)
+			return nil, "", fmt.Errorf("GET %s: %w", currentURL, err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -222,11 +244,15 @@ func authorize(docURL string) (*volgaAuth, error) {
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			loc := resp.Header.Get("Location")
 			if loc == "" {
-				return nil, fmt.Errorf("redirect without Location from %s", currentURL)
+				return nil, "", fmt.Errorf("redirect without Location from %s", currentURL)
 			}
 			if strings.HasPrefix(loc, "/") {
 				u, _ := url.Parse(currentURL)
 				loc = u.Scheme + "://" + u.Host + loc
+			}
+			// The anti-bot check: let the caller clear it or surface it.
+			if isCaptchaURL(loc) {
+				return nil, loc, nil
 			}
 			currentURL = loc
 			continue
@@ -238,7 +264,7 @@ func authorize(docURL string) (*volgaAuth, error) {
 	}
 
 	if finalBody == nil {
-		return nil, fmt.Errorf("too many redirects from %s", docURL)
+		return nil, "", fmt.Errorf("too many redirects from %s", docURL)
 	}
 
 	utils.Debugf("[VOLGA] final URL: %s", finalURL)
@@ -250,14 +276,14 @@ func authorize(docURL string) (*volgaAuth, error) {
 			preview = preview[:3000]
 		}
 		utils.Debugf("[VOLGA] HTML preview: %s", preview)
-		return nil, fmt.Errorf("client-config not found in %s", finalURL)
+		return nil, "", fmt.Errorf("client-config not found in %s", finalURL)
 	}
 
 	var cfg map[string]interface{}
 	dec := json.NewDecoder(bytes.NewReader(m[1]))
 	dec.UseNumber()
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse client-config: %w", err)
+		return nil, "", fmt.Errorf("parse client-config: %w", err)
 	}
 
 	utils.Debugf("[VOLGA] client-config keys: %v", mapKeys(cfg))
@@ -266,7 +292,7 @@ func authorize(docURL string) (*volgaAuth, error) {
 	editor, _ := cfg["editorParams"].(map[string]interface{})
 
 	if office == nil {
-		return nil, fmt.Errorf("officeActionData missing (keys: %v)", mapKeys(cfg))
+		return nil, "", fmt.Errorf("officeActionData missing (keys: %v)", mapKeys(cfg))
 	}
 
 	utils.Debugf("[VOLGA] office keys: %v", mapKeys(office))
@@ -287,10 +313,10 @@ func authorize(docURL string) (*volgaAuth, error) {
 	}
 
 	if actionURL == "" {
-		return nil, fmt.Errorf("action_url missing (keys: %v)", mapKeys(office))
+		return nil, "", fmt.Errorf("action_url missing (keys: %v)", mapKeys(office))
 	}
 	if a.AccessToken == "" {
-		return nil, fmt.Errorf("access_token missing")
+		return nil, "", fmt.Errorf("access_token missing")
 	}
 
 	ttlStr := formatTTL(ttl)
@@ -317,30 +343,30 @@ func authorize(docURL string) (*volgaAuth, error) {
 
 	resp2, err := session.Do(req2)
 	if err != nil {
-		return nil, fmt.Errorf("POST auth/initial: %w", err)
+		return nil, "", fmt.Errorf("POST auth/initial: %w", err)
 	}
 	resp2.Body.Close()
 
 	utils.Debugf("[VOLGA] auth/initial -> %d", resp2.StatusCode)
 
 	if resp2.StatusCode != 302 {
-		return nil, fmt.Errorf("auth/initial status %d (expected 302)", resp2.StatusCode)
+		return nil, "", fmt.Errorf("auth/initial status %d (expected 302)", resp2.StatusCode)
 	}
 
 	location := resp2.Header.Get("Location")
 	if location == "" {
-		return nil, fmt.Errorf("auth/initial no Location")
+		return nil, "", fmt.Errorf("auth/initial no Location")
 	}
 
 	utils.Debugf("[VOLGA] Location: %s", location[:minInt(len(location), 300)])
 
 	if strings.Contains(location, "/document/error/") {
-		return nil, fmt.Errorf("auth/initial returned /document/error/ — check access_token_ttl and Referer")
+		return nil, "", fmt.Errorf("auth/initial returned /document/error/ — check access_token_ttl and Referer")
 	}
 
 	locParsed, err := url.Parse(location)
 	if err != nil {
-		return nil, fmt.Errorf("parse Location: %w", err)
+		return nil, "", fmt.Errorf("parse Location: %w", err)
 	}
 	qs := locParsed.Query()
 
@@ -349,7 +375,7 @@ func authorize(docURL string) (*volgaAuth, error) {
 
 	jsonStr := qs.Get("json")
 	if jsonStr == "" {
-		return nil, fmt.Errorf("no json in Location (token=%v rp=%v)",
+		return nil, "", fmt.Errorf("no json in Location (token=%v rp=%v)",
 			a.Token != "", a.RequestPath != "")
 	}
 
@@ -357,7 +383,7 @@ func authorize(docURL string) (*volgaAuth, error) {
 	dec2 := json.NewDecoder(strings.NewReader(jsonStr))
 	dec2.UseNumber()
 	if err := dec2.Decode(&jsonData); err != nil {
-		return nil, fmt.Errorf("parse Location json: %w", err)
+		return nil, "", fmt.Errorf("parse Location json: %w", err)
 	}
 
 	a.SessionID = getStr(jsonData, "sessionId")
@@ -383,7 +409,7 @@ func authorize(docURL string) (*volgaAuth, error) {
 	req3.Header.Set("Referer", actionURL)
 	resp3, err := session.Do(req3)
 	if err != nil {
-		return nil, fmt.Errorf("GET Location: %w", err)
+		return nil, "", fmt.Errorf("GET Location: %w", err)
 	}
 	io.Copy(io.Discard, resp3.Body)
 	resp3.Body.Close()
@@ -391,13 +417,13 @@ func authorize(docURL string) (*volgaAuth, error) {
 	a.Cookies = jar.Cookies(locParsed)
 
 	if a.Token == "" || a.RequestPath == "" || a.UserIDStr == "" || a.Sign == "" {
-		return nil, fmt.Errorf("incomplete auth: token=%v rp=%v user=%v sign=%v",
+		return nil, "", fmt.Errorf("incomplete auth: token=%v rp=%v user=%v sign=%v",
 			a.Token != "", a.RequestPath != "", a.UserIDStr != "", a.Sign != "")
 	}
 
 	utils.Debugf("[VOLGA] auth OK: user=%d(%s) rp=%s sign=%s ts=%s origin=%s push=%s",
 		a.UserID, a.UserIDStr, a.RequestPath, a.Sign, a.TS, a.VolgaOrigin, a.PushURL)
-	return a, nil
+	return a, "", nil
 }
 
 // volgaOrigin is the scheme://host the session was issued for, falling back
@@ -565,9 +591,13 @@ func (r *relayClient) Start() {
 }
 
 func (r *relayClient) Stop() {
+	// Do NOT close queue/batchQueue here. Send() still fires during teardown --
+	// from the tunnel's send path and from the transport keep-alive, which Stop
+	// signals but does not join -- and a send on a closed channel panics. That
+	// was the intermittent crash right after Disconnect. Cancelling the context
+	// makes every worker flush and return (they select on ctx.Done); wg.Wait()
+	// joins them, after which the channels are unreferenced and collected.
 	r.cancel()
-	close(r.queue)
-	close(r.batchQueue)
 	r.wg.Wait()
 }
 
@@ -581,6 +611,14 @@ func (r *relayClient) Send(data []byte) error {
 
 	cp := make([]byte, len(data))
 	copy(cp, data)
+
+	// Bail out once stopped so a late keep-alive or tunnel send does no work
+	// (the channels are intentionally left open; see Stop).
+	select {
+	case <-r.ctx.Done():
+		return fmt.Errorf("relay stopped")
+	default:
+	}
 
 	select {
 	case r.batchQueue <- cp:
