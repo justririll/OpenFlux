@@ -46,6 +46,10 @@ func cursorFrame(payload string) string {
 	return `42["message",{"type":"cursor","cursor":"18;` + payload + `"}]`
 }
 
+// unlockDocumentFrame releases the auth lock the server takes on our behalf
+// when another editor joins; see handleMessage.
+const unlockDocumentFrame = `42["message",{"type":"unLockDocument","isSave":false,"unlock":true,"deleteIndex":-1,"releaseLocks":false}]`
+
 func authTokenFrame(token string) string {
 	return `40{"token":"` + token + `"}`
 }
@@ -79,6 +83,15 @@ const (
 	// the current, solvable challenge; once the user clears it (same IP), the
 	// next attempt goes through.
 	captchaHoldDelay = 15 * time.Second
+
+	// docInfoReuseFor bounds how long a fetched document token is reused to
+	// reconnect the socket without reloading the document page. The server
+	// drops sockets (close 1005) every few minutes; reloading the page for
+	// each one meant a 1-15s gap, sometimes a fresh anti-bot check, and the
+	// peer sitting alone in the document meanwhile - the "connected but
+	// nothing loads" stall. Reusing the token reconnects in well under a
+	// second; a stale one fails fast and the next attempt reloads the page.
+	docInfoReuseFor = 10 * time.Minute
 )
 
 type DocSession struct {
@@ -115,6 +128,11 @@ type YandexDocsTransport struct {
 	userCounter atomic.Int32
 	baseUserID  string
 	userID      string // stable across reconnects; guarded by Mu
+
+	// The last document info that produced a working session, reused for a
+	// fast reconnect; guarded by Mu. See docInfo.
+	cachedInfo   *YandexDocsInfo
+	cachedInfoAt time.Time
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -255,15 +273,53 @@ func (t *YandexDocsTransport) connectLoop() {
 	}
 }
 
+// docInfo returns the document info to connect with: the last working one
+// while it is recent enough to reuse (cached=true), else a fresh page fetch.
+func (t *YandexDocsTransport) docInfo(userID string) (info YandexDocsInfo, cached bool, err error) {
+	t.Mu.RLock()
+	c, at := t.cachedInfo, t.cachedInfoAt
+	t.Mu.RUnlock()
+	if c != nil && time.Since(at) < docInfoReuseFor {
+		return *c, true, nil
+	}
+	info, err = t.fetchDocInfo(t.url, userID)
+	return info, false, err
+}
+
+func (t *YandexDocsTransport) rememberDocInfo(info YandexDocsInfo) {
+	t.Mu.Lock()
+	t.cachedInfo, t.cachedInfoAt = &info, time.Now()
+	t.Mu.Unlock()
+}
+
+func (t *YandexDocsTransport) forgetDocInfo() {
+	t.Mu.Lock()
+	t.cachedInfo = nil
+	t.Mu.Unlock()
+}
+
 // runSession builds one WebSocket session and reads it until it fails. It
 // always releases the socket before returning.
 func (t *YandexDocsTransport) runSession() error {
 	userID := t.sessionUserID()
 
-	info, err := t.fetchDocInfo(t.url, userID)
+	info, cached, err := t.docInfo(userID)
 	if err != nil {
 		return fmt.Errorf("fetchDocInfo: %w", err)
 	}
+	// Reused info the server no longer accepts fails at the handshake: drop
+	// it so the next attempt reloads the page. Fresh info that got a socket
+	// becomes the info to reuse. (A socket the server closes later - even
+	// straight away - is its routine churn, not a stale token.)
+	connected := false
+	defer func() {
+		switch {
+		case cached && !connected:
+			t.forgetDocInfo()
+		case !cached && connected:
+			t.rememberDocInfo(info)
+		}
+	}()
 
 	// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
 	// can't hang the whole transport (HandshakeTimeout alone proved
@@ -293,7 +349,8 @@ func (t *YandexDocsTransport) runSession() error {
 	// The old code never closed the socket, leaking one fd and one blocked
 	// goroutine on every single reconnect.
 	defer conn.Close()
-	utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
+	connected = true
+	utils.Debugf("[YDOCS] WebSocket connected to %s (reused token: %v)", info.Host, cached)
 
 	session := &DocSession{Info: info, Conn: conn, UserID: userID}
 	t.setSession(session)
@@ -368,6 +425,31 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 	if text == "3" {
+		return
+	}
+
+	if !strings.Contains(text, "saveChanges") && !strings.Contains(text, "cursor") {
+		// Control traffic from the document server (auth replies, drops,
+		// participant changes) - the only clue when it closes the socket.
+		utils.Debugf("[YDOCS] server: %.300s", text)
+	}
+
+	// When a second editor joins, the server locks the document on behalf of
+	// the one already in it and holds the newcomer in "waitAuth" until that
+	// first editor answers with unLockDocument - a real editor does so as it
+	// switches to co-editing. We never did, so after the lock expired (~30s)
+	// the server dropped the first peer (disconnectReason 4007 "drop"); it
+	// rejoined, became the waiter, and 30s later the other peer was dropped
+	// in turn: an endless ping-pong in which neither side hears the other for
+	// long - the "connected but nothing loads" stall. Answering every
+	// participant change is harmless: the server ignores an unlock from a
+	// connection that holds no lock.
+	if strings.Contains(text, `"type":"connectState"`) {
+		if session != nil && session.Conn != nil {
+			if err := session.safeWrite(websocket.TextMessage, []byte(unlockDocumentFrame)); err != nil {
+				utils.Debugf("[YDOCS] unLockDocument: %v", err)
+			}
+		}
 		return
 	}
 

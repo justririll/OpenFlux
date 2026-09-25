@@ -54,10 +54,6 @@ var (
 	passJar, _ = cookiejar.New(nil)
 )
 
-// solveReuseWindow lets a caller that queued behind another solve reuse that
-// fresh result instead of launching a second browser pass.
-const solveReuseWindow = 20 * time.Second
-
 // SetCaptchaSolver installs the browser used to clear Yandex's anti-bot check.
 // nil removes it, after which a captcha is only surfaced as a [CAPTCHA] log line.
 func SetCaptchaSolver(s CaptchaSolver) {
@@ -91,8 +87,9 @@ func solveCaptcha(pageURL string) bool {
 	solveMu.Lock()
 	defer solveMu.Unlock()
 	// Someone else solved while we waited for the lock: their cookies are
-	// already in passJar.
-	if lastSolved.After(requested.Add(-solveReuseWindow)) {
+	// already in passJar. A pass from before this call is the one that was
+	// just refused, so it does not count.
+	if lastSolved.After(requested) {
 		return true
 	}
 
