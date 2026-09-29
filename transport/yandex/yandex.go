@@ -527,9 +527,15 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	// surface the URL -- logged unconditionally with a marker the app watches
 	// for and opens -- then hold before the next attempt so this same
 	// challenge stays solvable rather than a fresh one being spun every retry.
-	log.Printf("[CAPTCHA] %s", captchaURL)
+	// While the solver is backing off, hold until it is ready again rather
+	// than refetching a page that can only redirect to the captcha.
+	hold := captchaHoldDelay
+	if d := captchaRetryIn(); d > hold {
+		hold = d
+	}
+	log.Printf("[CAPTCHA] %s (next try in %s)", captchaURL, hold.Round(time.Second))
 	select {
-	case <-time.After(captchaHoldDelay):
+	case <-time.After(hold):
 	case <-t.stopped:
 	}
 	return YandexDocsInfo{}, fmt.Errorf("captcha required (open the surfaced link and solve it)")

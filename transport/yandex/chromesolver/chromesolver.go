@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -49,8 +50,18 @@ func Find() (string, error) {
 // then returns the cookies for every host it passed through, as a JSON object of
 // URL -> Cookie header.
 func (s *Solver) Solve(pageURL string) (string, error) {
+	// Own the profile directory: chromedp's automatic one is left behind
+	// whenever Chrome dies with the solve (a restart, a timeout), and those
+	// piled up in /tmp on the exit node.
+	profile, err := os.MkdirTemp("", "openflux-chrome-")
+	if err != nil {
+		return "", fmt.Errorf("profile dir: %w", err)
+	}
+	defer os.RemoveAll(profile)
+
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(s.execPath),
+		chromedp.UserDataDir(profile),
 		// Exit nodes run as root, where Chrome refuses to start sandboxed.
 		chromedp.NoSandbox,
 		chromedp.Flag("disable-dev-shm-usage", true),
@@ -86,6 +97,12 @@ func (s *Solver) Solve(pageURL string) (string, error) {
 		)
 		if err == nil && ready && !strings.Contains(loc, "captcha") {
 			break
+		}
+		// /showcaptchafast is the automatic check; /showcaptcha (without
+		// "fast") is the interactive one Yandex falls back to when the check
+		// fails. No headless browser gets past that, so stop now.
+		if strings.Contains(loc, "/showcaptcha?") {
+			return "", fmt.Errorf("Yandex wants an interactive captcha (%.60s...): this IP is flagged", loc)
 		}
 		select {
 		case <-ctx.Done():

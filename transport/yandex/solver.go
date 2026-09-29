@@ -49,6 +49,46 @@ var (
 	solveMu    sync.Mutex
 	lastSolved time.Time
 
+	// After a failed solve the browser is not tried again until solveRetryAt,
+	// backing off from solveBackoffBase to solveBackoffMax. Once Yandex serves
+	// its real (interactive) captcha to an IP, relaunching Chrome every few
+	// seconds cannot pass it and only deepens the IP's bot reputation: on one
+	// exit node three instances did so ~180 times an hour for over a day.
+	// Guarded by solveMu.
+	solveFailures int
+	solveRetryAt  time.Time
+)
+
+const (
+	solveBackoffBase = 5 * time.Minute
+	solveBackoffMax  = time.Hour
+)
+
+// captchaRetryIn is how long until the solver will try again after a failure;
+// zero when it is ready. Fetchers hold at least this long before refetching,
+// so a blocked IP is not pestered with document requests either.
+func captchaRetryIn() time.Duration {
+	solveMu.Lock()
+	defer solveMu.Unlock()
+	if d := time.Until(solveRetryAt); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// recordSolveFailure schedules the next browser attempt. Caller holds solveMu.
+func recordSolveFailure() {
+	solveFailures++
+	d := solveBackoffBase << (solveFailures - 1)
+	if d > solveBackoffMax || d <= 0 {
+		d = solveBackoffMax
+	}
+	solveRetryAt = time.Now().Add(d)
+	log.Printf("[CAPTCHA] next browser attempt in %s (failure %d in a row)", d, solveFailures)
+}
+
+var (
+
 	// passJar holds the browser's pass cookies. Every Yandex document fetch
 	// reads from it, so one solve serves all transports in the process.
 	passJar, _ = cookiejar.New(nil)
@@ -92,24 +132,32 @@ func solveCaptcha(pageURL string) bool {
 	if lastSolved.After(requested) {
 		return true
 	}
+	// Still backing off from a failure: do not relaunch the browser.
+	if time.Now().Before(solveRetryAt) {
+		return false
+	}
 
 	log.Printf("[CAPTCHA] anti-bot check hit, clearing it in a browser...")
 	start := time.Now()
 	raw, err := s.Solve(pageURL)
 	if err != nil {
 		log.Printf("[CAPTCHA] browser solve failed: %v", err)
+		recordSolveFailure()
 		return false
 	}
 	n, err := loadPassCookies(raw)
 	if err != nil {
 		log.Printf("[CAPTCHA] browser returned unusable cookies: %v", err)
+		recordSolveFailure()
 		return false
 	}
 	if n == 0 {
 		log.Printf("[CAPTCHA] browser returned no cookies")
+		recordSolveFailure()
 		return false
 	}
 	lastSolved = time.Now()
+	solveFailures, solveRetryAt = 0, time.Time{}
 	log.Printf("[CAPTCHA] cleared in %s (%d cookies)", time.Since(start).Round(100*time.Millisecond), n)
 	return true
 }
