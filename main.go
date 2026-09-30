@@ -3,12 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	_ "github.com/wlynxg/anet"
 	"log"
 	"os"
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
-        _ "github.com/wlynxg/anet"
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/transport/oneme"
@@ -27,7 +27,7 @@ var (
 
 func main() {
 	//os.Setenv("GODEBUG", "netdns=go")
-        fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress\n")
 
 	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
 	client := flag.Bool("client", false, "Run as client")
@@ -43,6 +43,9 @@ func main() {
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
 	browser := flag.String("browser", "auto",
 		"Chrome/Chromium used to clear Yandex's anti-bot check: a path, \"auto\" to look on PATH, or \"off\"")
+	browserProfile := flag.String("browser-profile", "",
+		"Optional: a Chrome profile in which Yandex's interactive captcha was solved by hand "+
+			"(see openflux-captcha); each anti-bot solve starts from a copy of it. Used only if it exists")
 	flag.Parse()
 
 	if localIP != "" {
@@ -92,7 +95,7 @@ func main() {
 	// Downstream transports only ever see the clean document URL.
 	globalDocUrl = link.URL
 
-	installCaptchaSolver(*browser)
+	installCaptchaSolver(*browser, *browserProfile)
 
 	config := transport.DefaultConfig()
 	var inner transport.Transport
@@ -155,7 +158,7 @@ func main() {
 // installCaptchaSolver hands the Yandex transports a headless Chrome to clear
 // the anti-bot check that now fronts every document fetch. Without one the
 // transport can only log the captcha URL and wait for a human.
-func installCaptchaSolver(browser string) {
+func installCaptchaSolver(browser, profile string) {
 	if browser == "off" {
 		return
 	}
@@ -168,6 +171,18 @@ func installCaptchaSolver(browser string) {
 		}
 		path = p
 	}
-	yandex.SetCaptchaSolver(chromesolver.New(path))
+	s := chromesolver.New(path)
+	// The profile is optional and may not exist yet (nobody has solved by
+	// hand); it is checked here, at start, so a later-created one needs a
+	// restart - which the openflux-captcha helper does anyway.
+	if profile != "" {
+		if st, err := os.Stat(profile); err == nil && st.IsDir() {
+			s.WithSeedProfile(profile)
+			log.Printf("Anti-bot solver: %s, seeded from %s", path, profile)
+			yandex.SetCaptchaSolver(s)
+			return
+		}
+	}
+	yandex.SetCaptchaSolver(s)
 	log.Printf("Anti-bot solver: %s", path)
 }

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Solve Yandex's interactive captcha by hand, from this server's own IP.
+#
+#   openflux-captcha start   launch a headless Chrome you drive from your PC
+#   openflux-captcha done    close it and restart the exit nodes
+#   openflux-captcha status
+#
+# When Yandex flags the server's IP, the exit nodes' automatic anti-bot solver
+# lands on an interactive captcha only a person can pass. This opens the
+# document in a Chrome on the server, with its DevTools port on 127.0.0.1 only,
+# for you to reach over an SSH tunnel and click through. The pass it earns
+# stays in $PROFILE, which every node's solver copies before each attempt
+# (--browser-profile), so the nodes carry on with your pass.
+set -euo pipefail
+
+PROFILE=/var/lib/openflux/chrome
+PORT=9222
+CHROME=/usr/local/bin/chrome-headless-shell
+PIDFILE=/run/openflux-captcha.pid
+LOG=/var/log/openflux-captcha.log
+
+doc_url() {
+	# Any node's document will do: the pass belongs to the IP and the
+	# browser profile, not to a document.
+	local f
+	for f in /etc/openflux/instances/*.env; do
+		grep -m1 '^YANDEX_DOC_URL=' "$f" | cut -d= -f2- | tr -d '"' |
+			sed -E 's#^ydocs://#https://#; s/#.*//' && return
+	done
+}
+
+running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+
+case "${1:-}" in
+start)
+	if running; then
+		echo "already running (pid $(cat "$PIDFILE")) - finish with: openflux-captcha done"
+		exit 0
+	fi
+	url="${2:-$(doc_url)}"
+	mkdir -p "$PROFILE"
+	nohup "$CHROME" --no-sandbox --disable-dev-shm-usage \
+		--user-data-dir="$PROFILE" --window-size=1280,900 \
+		--remote-debugging-address=127.0.0.1 --remote-debugging-port="$PORT" \
+		"$url" >"$LOG" 2>&1 &
+	echo $! >"$PIDFILE"
+	sleep 2
+	running || { echo "Chrome did not start - see $LOG" >&2; exit 1; }
+	cat <<-EOF
+	Chrome is up on the server with $url
+
+	On your PC:
+	  1. ssh -N -L $PORT:127.0.0.1:$PORT openflux-vps      (leave it running)
+	  2. Open edge://inspect (or chrome://inspect), "Configure...",
+	     add  localhost:$PORT , then click "inspect" under the Yandex tab.
+	  3. In DevTools turn on the screencast (top-left, the phone/screen icon)
+	     and solve the captcha in it until the document opens.
+	  4. Back here:  openflux-captcha done
+	EOF
+	;;
+done | stop)
+	if running; then
+		kill "$(cat "$PIDFILE")" 2>/dev/null || true
+		for _ in $(seq 1 20); do running || break; sleep 0.25; done
+	fi
+	rm -f "$PIDFILE"
+	# Restart so every node reloads the profile and drops its backoff.
+	systemctl restart 'openflux-exit@*.service' --all
+	echo "Chrome closed, exit nodes restarted. Watch them with:"
+	echo "  journalctl -fu 'openflux-exit@*' | grep CAPTCHA"
+	;;
+status)
+	if running; then echo "manual Chrome: running (pid $(cat "$PIDFILE"))"; else echo "manual Chrome: not running"; fi
+	[ -d "$PROFILE" ] && echo "profile: $PROFILE ($(du -sh "$PROFILE" | cut -f1))" || echo "profile: none yet"
+	;;
+*)
+	sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+	exit 1
+	;;
+esac

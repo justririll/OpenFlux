@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,11 +28,56 @@ const solveTimeout = 45 * time.Second
 // Solver implements yandex.CaptchaSolver with a headless Chrome/Chromium.
 type Solver struct {
 	execPath string
+
+	// seedProfile, when set, is a Chrome profile each solve starts from - one
+	// in which a person has cleared Yandex's interactive captcha by hand (see
+	// the openflux-captcha helper), so its pass cookie comes along. It is
+	// copied, never opened in place: several exit-node instances may solve at
+	// once and Chrome locks a profile to a single process.
+	seedProfile string
 }
 
 // New returns a Solver using the Chrome binary at execPath.
 func New(execPath string) *Solver {
 	return &Solver{execPath: execPath}
+}
+
+// WithSeedProfile makes every solve start from a copy of the profile at dir.
+func (s *Solver) WithSeedProfile(dir string) *Solver {
+	s.seedProfile = dir
+	return s
+}
+
+// copyProfile copies a Chrome profile, minus its process locks and caches.
+func copyProfile(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, "Singleton") || strings.Contains(name, "Cache") || name == "Crashpad" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o600)
+	})
 }
 
 // Find looks for a Chrome or Chromium binary on PATH.
@@ -58,6 +105,11 @@ func (s *Solver) Solve(pageURL string) (string, error) {
 		return "", fmt.Errorf("profile dir: %w", err)
 	}
 	defer os.RemoveAll(profile)
+	if s.seedProfile != "" {
+		if err := copyProfile(s.seedProfile, profile); err != nil {
+			return "", fmt.Errorf("copy seed profile %s: %w", s.seedProfile, err)
+		}
+	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(s.execPath),
