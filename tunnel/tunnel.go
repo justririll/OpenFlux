@@ -72,7 +72,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocolCUBIC},
 	})
 
-        SetTCPBuffers(t.gvisorStack)
+	SetTCPBuffers(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = t.sendToTransport
@@ -83,7 +83,9 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		utils.Debugf("[TUNNEL] CreateNIC tunnel error: %v", err)
 	}
 
-	if isExitNode {
+	if isExitNode && egressDialer != nil {
+		t.setupProxyExit(tunnelNIC)
+	} else if isExitNode {
 		t.setupExitNode(tunnelNIC)
 	} else {
 		t.setupClient(tunnelNIC)

@@ -117,6 +117,11 @@ func (s *Solver) Solve(pageURL string) (string, error) {
 		// Exit nodes run as root, where Chrome refuses to start sandboxed.
 		chromedp.NoSandbox,
 		chromedp.Flag("disable-dev-shm-usage", true),
+		// Go's HTTP client ignores the OS proxy setting, so Chrome must too:
+		// the pass is bound to the IP it was earned from, and on a desktop
+		// with a system proxy (v2rayN, say) Chrome would otherwise earn it
+		// from the proxy's address and hand Go cookies that do not work.
+		chromedp.Flag("no-proxy-server", true),
 	)
 	actx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancelAlloc()

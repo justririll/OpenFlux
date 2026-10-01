@@ -43,6 +43,9 @@ func main() {
 			"Both peers must use the same secret; unset means unencrypted, unchanged behavior")
 	browser := flag.String("browser", "auto",
 		"Chrome/Chromium used to clear Yandex's anti-bot check: a path, \"auto\" to look on PATH, or \"off\"")
+	egressProxy := flag.String("egress-proxy", "",
+		"Exit node only: send the client's traffic out through this SOCKS5 proxy (socks5://host:port) "+
+			"instead of raw sockets - no root, driver or RST rule needed")
 	browserProfile := flag.String("browser-profile", "",
 		"Optional: a Chrome profile in which Yandex's interactive captcha was solved by hand "+
 			"(see openflux-captcha); each anti-bot solve starts from a copy of it. Used only if it exists")
@@ -50,6 +53,11 @@ func main() {
 
 	if localIP != "" {
 		tunnel.SetLocalIP(localIP)
+	}
+	if *egressProxy != "" {
+		if err := tunnel.SetEgressProxy(*egressProxy); err != nil {
+			log.Fatalf("Invalid --egress-proxy: %v", err)
+		}
 	}
 
 	// The exit node often runs on a tiny VPS, so the heap is kept modest -
@@ -133,6 +141,10 @@ func main() {
 
 	tun := tunnel.NewTCPTunnel(trans, *exitNode)
 
+	if *exitNode && *egressProxy != "" {
+		log.Printf("Running as EXIT NODE, egress via %s (no raw socket, no RST rule needed)", *egressProxy)
+		select {}
+	}
 	if *exitNode {
 		log.Printf("Running as EXIT NODE (needs root for raw socket)")
 		if localIP != "" {
