@@ -64,6 +64,10 @@ const (
 	// egressMaxInFlight caps half-open connections awaiting their dial, the
 	// same congestion guard the client side applies.
 	egressMaxInFlight = 512
+
+	// Send buffer range towards the client in proxy mode; see setupProxyExit.
+	egressSendBufDefault = 128 << 10
+	egressSendBufMax     = 512 << 10
 )
 
 // setupProxyExit makes the tunnel NIC accept connections to any address and
@@ -78,6 +82,16 @@ func (t *TCPTunnel) setupProxyExit(tunnelNIC tcpip.NICID) {
 		utils.Debugf("[TUNNEL] spoofing: %v", err)
 	}
 	s.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: tunnelNIC})
+
+	// Here this stack is the sender towards the client, not a forwarder, so
+	// its send buffer bounds how much it keeps in flight across the document
+	// relay. At the raw exit's 1MB default / 8MB max it pushed bursts the
+	// relay could not carry - thousands of retransmits a minute and stalls.
+	// The receive side (client uploads) keeps the large range.
+	snd := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: egressSendBufDefault, Max: egressSendBufMax}
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
+		utils.Debugf("[TUNNEL] egress send buffer: %v", err)
+	}
 
 	fwd := tcp.NewForwarder(s, 0, egressMaxInFlight, t.forwardViaProxy)
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
