@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"universal-bypass-tool/utils"
 )
 
 // Yandex now fronts docs.yandex.* with a JavaScript anti-bot check: a client
@@ -92,6 +94,11 @@ var (
 	// passJar holds the browser's pass cookies. Every Yandex document fetch
 	// reads from it, so one solve serves all transports in the process.
 	passJar, _ = cookiejar.New(nil)
+
+	// passUA is the User-Agent of the browser that earned the pass, when the
+	// solver reports it; see documentUserAgent.
+	passUAMu sync.Mutex
+	passUA   string
 )
 
 // SetCaptchaSolver installs the browser used to clear Yandex's anti-bot check.
@@ -169,6 +176,16 @@ func loadPassCookies(raw string) (int, error) {
 	if err := json.Unmarshal([]byte(raw), &byURL); err != nil {
 		return 0, err
 	}
+	// Optional: the browser's User-Agent, sent along under a non-URL key. The
+	// pass may be tied to the browser that earned it, so document fetches
+	// then present the same User-Agent.
+	if ua, ok := byURL[passUAKey]; ok {
+		delete(byURL, passUAKey)
+		passUAMu.Lock()
+		passUA = ua
+		passUAMu.Unlock()
+		utils.Debugf("[CAPTCHA] browser User-Agent: %s", ua)
+	}
 	n := 0
 	for rawURL, header := range byURL {
 		u, err := url.Parse(rawURL)
@@ -178,8 +195,28 @@ func loadPassCookies(raw string) (int, error) {
 		cookies := parseCookieHeader(header)
 		passJar.SetCookies(u, cookies)
 		n += len(cookies)
+		names := make([]string, len(cookies))
+		for i, c := range cookies {
+			names[i] = c.Name
+		}
+		utils.Debugf("[CAPTCHA] pass cookies for %s: %s", u.Host, strings.Join(names, ","))
 	}
 	return n, nil
+}
+
+// passUAKey carries the browser's User-Agent in a solver result.
+const passUAKey = "user-agent"
+
+// documentUserAgent is the User-Agent for document fetches: the browser's,
+// once a solver has reported it, else the bare token that the page is served
+// to without a pass.
+func documentUserAgent() string {
+	passUAMu.Lock()
+	defer passUAMu.Unlock()
+	if passUA != "" {
+		return passUA
+	}
+	return "Mozilla/5.0"
 }
 
 // parseCookieHeader splits a "a=1; b=2" Cookie header into cookies.
@@ -217,10 +254,18 @@ func (j *passAwareJar) Cookies(u *url.URL) []*http.Cookie {
 	for _, c := range out {
 		seen[c.Name] = true
 	}
+	var own, pass, shadowed []string
+	for _, c := range out {
+		own = append(own, c.Name)
+	}
 	for _, c := range passJar.Cookies(u) {
 		if !seen[c.Name] {
 			out = append(out, c)
+			pass = append(pass, c.Name)
+		} else {
+			shadowed = append(shadowed, c.Name)
 		}
 	}
+	utils.Debugf("[CAPTCHA] cookies to %s: server-set=%v pass=%v pass-overridden=%v", u.Host, own, pass, shadowed)
 	return out
 }

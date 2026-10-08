@@ -560,10 +560,10 @@ func (t *YandexDocsTransport) fetchDocInfoOnce(url, userID string) (YandexDocsIn
 
 	utils.Debugf("[YDOCS] fetchDocInfo GET %s", url)
 	req, _ := http.NewRequest("GET", url, nil)
-	// Keep this minimal on purpose: a full browser User-Agent trips Yandex's
-	// anti-bot (it answers with a showcaptcha page); the bare token is served
-	// the real document page with client-config intact.
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	// Without a pass, keep this minimal: a full browser User-Agent trips
+	// Yandex's anti-bot on its own. With a pass, present the User-Agent of the
+	// browser that earned it (see documentUserAgent).
+	req.Header.Set("User-Agent", documentUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return YandexDocsInfo{}, "", err
